@@ -116,3 +116,37 @@ def test_ui_backtest_rejects_invalid_strategy_inputs():
     response = client.post("/api/backtest", json={"start": "2025-02-01", "end": "2025-01-01", "interval": "1H"})
     assert response.status_code == 400
     assert "before" in response.json()["error"]
+
+
+def test_ui_risk_settings_round_trip_and_validation(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    import src.ui.app as uiapp
+
+    monkeypatch.setattr(uiapp, "SETTINGS_PATH", tmp_path / "ui_settings.json")
+    client = TestClient(uiapp.app)
+
+    initial = client.get("/api/settings/risk")
+    assert initial.status_code == 200
+    assert initial.json()["risk"]["max_leverage"] == 3.0
+
+    saved = client.post(
+        "/api/settings/risk",
+        json={
+            "daily_loss_limit": 750,
+            "max_consecutive_losses": 4,
+            "max_leverage": 5,
+            "max_total_exposure": 12000,
+            "max_symbol_exposure": 6000,
+            "risk_per_trade_pct": 0.75,
+            "kill_switch": True,
+            "halt_on_connection_issue": True,
+            "halt_on_data_delay": False,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["risk"]["daily_loss_limit"] == 750
+    assert client.get("/api/settings/risk").json()["risk"]["kill_switch"] is True
+
+    invalid = client.post("/api/settings/risk", json={"max_leverage": 0})
+    assert invalid.status_code == 400
+    assert "max_leverage" in invalid.json()["error"]

@@ -129,21 +129,30 @@ def _today_pnl(fills: Iterable[dict[str, Any]], now: datetime | None = None) -> 
     return total
 
 
-def build_risk_snapshot(account: dict[str, Any], positions: list[dict[str, Any]], fills: list[dict[str, Any]]) -> dict[str, Any]:
+def build_risk_snapshot(
+    account: dict[str, Any],
+    positions: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = settings or {}
     equity = account.get("equity")
     daily_pnl = _today_pnl(fills)
     max_daily_loss_pct = 0.03
     max_leverage = max((float(row["leverage"]) for row in positions if row.get("leverage") is not None), default=None)
-    daily_limit = abs(float(equity or 0.0)) * max_daily_loss_pct if equity is not None else None
+    configured_daily_limit = _number(settings.get("daily_loss_limit"), None)
+    daily_limit = configured_daily_limit if configured_daily_limit and configured_daily_limit > 0 else abs(float(equity or 0.0)) * max_daily_loss_pct if equity is not None else None
+    configured_max_leverage = _number(settings.get("max_leverage"), 3.0) or 3.0
+    configured_max_losses = int(_number(settings.get("max_consecutive_losses"), 3) or 3)
     usage_pct = min(100.0, abs(min(0.0, daily_pnl)) / daily_limit * 100) if daily_limit else None
     return {
         "daily_pnl": daily_pnl,
         "daily_loss_limit": daily_limit,
         "daily_loss_usage_pct": usage_pct,
         "consecutive_losses": 0,
-        "max_consecutive_losses": 3,
+        "max_consecutive_losses": configured_max_losses,
         "max_leverage": max_leverage,
-        "configured_max_leverage": 3.0,
+        "configured_max_leverage": configured_max_leverage,
         "gross_exposure": sum(float(row.get("notional") or 0.0) for row in positions),
         "position_count": len(positions),
         "status": "ready" if account.get("status") == "connected" else "waiting_for_account",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,6 +15,8 @@ CANDLE_COLUMNS = [
     "timestamp", "open", "high", "low", "close", "volume", "turnover", "symbol", "category", "interval", "market_type"
 ]
 STOCK_MARKETS = frozenset({KOR_STOCK, US_STOCK})
+_INITIALIZED_DATABASES: set[str] = set()
+_INIT_LOCK = threading.Lock()
 
 
 def save_csv(df: pd.DataFrame, path: str):
@@ -239,6 +242,16 @@ def _init_schema(con: sqlite3.Connection) -> None:
 
 
 def init_db(db_path: str = DEFAULT_DB) -> None:
+    resolved = str(Path(db_path).resolve())
+    if resolved in _INITIALIZED_DATABASES and Path(resolved).exists():
+        return
+    with _INIT_LOCK:
+        if resolved in _INITIALIZED_DATABASES and Path(resolved).exists():
+            return
+        _init_database_once(db_path, resolved)
+
+
+def _init_database_once(db_path: str, resolved: str) -> None:
     try:
         with _connect(db_path) as con:
             _init_schema(con)
@@ -248,6 +261,7 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
         _quarantine_corrupt_db(db_path)
         with _connect(db_path) as con:
             _init_schema(con)
+    _INITIALIZED_DATABASES.add(resolved)
 
 
 def upsert_candles(

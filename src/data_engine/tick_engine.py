@@ -16,6 +16,7 @@ from src.bitget.websocket_client import PUBLIC_WS, trade_topic
 from src.data_engine.candle_stream import merge_candle_frames
 from src.data_engine.canonical import bucket_start_ms as canonical_bucket_start_ms
 from src.data_engine.storage import save_csv, upsert_candles
+from src.data_engine.write_buffer import CandleWriteBuffer
 from src.utils.time import INTERVAL_MS, now_ms
 
 try:
@@ -203,11 +204,10 @@ class LiveTickCandleStream:
         self.cache = pd.DataFrame()
         self.tick_store = TickStore(config.tick_path)
         self.aggregator: CandleAggregator | None = None
+        self.writer = CandleWriteBuffer()
         self.last_status = "init"
 
     def _save(self) -> None:
-        if not self.cache.empty:
-            upsert_candles(self.cache, source="bitget_tick_live")
         if self.config.write_csv and self.config.cache_path and not self.cache.empty:
             save_csv(self.cache, self.config.cache_path)
 
@@ -231,6 +231,8 @@ class LiveTickCandleStream:
         if frames:
             self.cache = merge_candle_frames(pd.DataFrame(), pd.concat(frames, ignore_index=True), max_rows=self.config.max_rows)
         self.aggregator = CandleAggregator(self.config.symbol, self.config.category, self.config.interval, seed=self.cache)
+        if not self.cache.empty:
+            upsert_candles(self.cache, source="bitget_tick_bootstrap")
         self._save()
         return self.cache.copy()
 
@@ -262,49 +264,54 @@ class LiveTickCandleStream:
         if self.aggregator is None:
             self.initial()
         backoff = 1.0
-        while True:
-            try:
-                async for msg in self._ws_messages():
-                    ticks = parse_trade_message(msg, self.config.symbol)
-                    if not ticks:
-                        continue
-                    self.tick_store.append_many(ticks)
-                    updated_rows = [self.aggregator.update(t) for t in ticks] if self.aggregator else []
-                    df = candles_from_rows(updated_rows)
-                    if df.empty:
-                        continue
-                    self.cache = merge_candle_frames(self.cache, df, max_rows=self.config.max_rows)
-                    self._save()
-                    backoff = 1.0
-                    latest = df.iloc[-1]
-                    yield {
-                        "type": "candle_update",
-                        "engine": "tick_aggregator",
-                        "transport": "trade_websocket",
-                        "tickCount": len(ticks),
-                        "candle": self._row_to_chart(latest),
-                        "rows": int(len(self.cache)),
-                        "lastTick": {"price": ticks[-1].price, "size": ticks[-1].size, "side": ticks[-1].side, "timestamp": ticks[-1].timestamp},
-                    }
-            except Exception as exc:
-                self.last_status = f"ws_error: {exc}"
-                await asyncio.sleep(backoff)
-                backoff = min(30.0, backoff * 1.7)
-                # Fallback is intentionally low-frequency REST candle merge, not tight polling.
+        await self.writer.start()
+        try:
+            while True:
                 try:
-                    if self.config.interval not in SECOND_INTERVALS:
-                        df = self._seed_from_rest().tail(5)
+                    async for msg in self._ws_messages():
+                        ticks = parse_trade_message(msg, self.config.symbol)
+                        if not ticks:
+                            continue
+                        self.tick_store.append_many(ticks)
+                        updated_rows = [self.aggregator.update(t) for t in ticks] if self.aggregator else []
+                        df = candles_from_rows(updated_rows)
+                        if df.empty:
+                            continue
                         self.cache = merge_candle_frames(self.cache, df, max_rows=self.config.max_rows)
-                        if self.aggregator:
-                            self.aggregator = CandleAggregator(self.config.symbol, self.config.category, self.config.interval, seed=self.cache)
+                        await self.writer.put_frame(df, source="bitget_tick_live")
                         self._save()
-                        yield {"type": "status", "engine": "tick_aggregator", "transport": "rest_fallback", "message": str(exc), "rows": int(len(self.cache))}
-                        for _, row in df.tail(2).iterrows():
-                            yield {"type": "candle_update", "engine": "tick_aggregator", "transport": "rest_fallback", "candle": self._row_to_chart(row), "rows": int(len(self.cache))}
-                    else:
-                        yield {"type": "status", "engine": "tick_aggregator", "transport": "offline", "message": f"trade WS failed; second candles need live ticks: {exc}", "rows": int(len(self.cache))}
-                except Exception as rest_exc:
-                    yield {"type": "status", "engine": "tick_aggregator", "transport": "offline", "message": f"WS and REST failed: {rest_exc}", "rows": int(len(self.cache))}
+                        backoff = 1.0
+                        latest = df.iloc[-1]
+                        yield {
+                            "type": "candle_update",
+                            "engine": "tick_aggregator",
+                            "transport": "trade_websocket",
+                            "tickCount": len(ticks),
+                            "candle": self._row_to_chart(latest),
+                            "rows": int(len(self.cache)),
+                            "lastTick": {"price": ticks[-1].price, "size": ticks[-1].size, "side": ticks[-1].side, "timestamp": ticks[-1].timestamp},
+                        }
+                except Exception as exc:
+                    self.last_status = f"ws_error: {exc}"
+                    await asyncio.sleep(backoff)
+                    backoff = min(30.0, backoff * 1.7)
+                    try:
+                        if self.config.interval not in SECOND_INTERVALS:
+                            df = self._seed_from_rest().tail(5)
+                            self.cache = merge_candle_frames(self.cache, df, max_rows=self.config.max_rows)
+                            if self.aggregator:
+                                self.aggregator = CandleAggregator(self.config.symbol, self.config.category, self.config.interval, seed=self.cache)
+                            await self.writer.put_frame(df, source="bitget_tick_rest_fallback")
+                            self._save()
+                            yield {"type": "status", "engine": "tick_aggregator", "transport": "rest_fallback", "message": str(exc), "rows": int(len(self.cache))}
+                            for _, row in df.tail(2).iterrows():
+                                yield {"type": "candle_update", "engine": "tick_aggregator", "transport": "rest_fallback", "candle": self._row_to_chart(row), "rows": int(len(self.cache))}
+                        else:
+                            yield {"type": "status", "engine": "tick_aggregator", "transport": "offline", "message": f"trade WS failed; second candles need live ticks: {exc}", "rows": int(len(self.cache))}
+                    except Exception as rest_exc:
+                        yield {"type": "status", "engine": "tick_aggregator", "transport": "offline", "message": f"WS and REST failed: {rest_exc}", "rows": int(len(self.cache))}
+        finally:
+            await self.writer.close()
 
     @staticmethod
     def _row_to_chart(row: pd.Series | dict[str, Any]) -> dict[str, Any]:

@@ -2,6 +2,84 @@ from dataclasses import dataclass
 from typing import Any, Optional
 import time, uuid
 
+
+@dataclass(frozen=True, slots=True)
+class Candle:
+    """Normalized OHLCV candle shared by live data and persistence layers."""
+
+    market_type: str
+    symbol: str
+    category: str
+    interval: str
+    open_time_ms: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+    turnover: float = 0.0
+    is_closed: bool = False
+    source: str = "bitget"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "market_type", str(self.market_type).upper())
+        object.__setattr__(self, "symbol", str(self.symbol).upper())
+        object.__setattr__(self, "category", str(self.category).upper())
+        object.__setattr__(self, "open_time_ms", int(self.open_time_ms))
+        for name in ("open", "high", "low", "close", "volume", "turnover"):
+            object.__setattr__(self, name, float(getattr(self, name)))
+        if self.open_time_ms <= 0:
+            raise ValueError("candle timestamp must be positive")
+        if min(self.open, self.high, self.low, self.close) <= 0:
+            raise ValueError("candle OHLC values must be positive")
+        if self.high < max(self.open, self.close) or self.low > min(self.open, self.close):
+            raise ValueError("candle OHLC values are inconsistent")
+        if self.volume < 0 or self.turnover < 0:
+            raise ValueError("candle volume and turnover cannot be negative")
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any], defaults: dict[str, Any] | None = None) -> "Candle":
+        values = dict(defaults or {})
+        values.update({key: value for key, value in row.items() if value is not None})
+        timestamp = values.get("open_time_ms", values.get("timestamp", values.get("time")))
+        if timestamp is None:
+            raise ValueError("candle timestamp is required")
+        timestamp = int(float(timestamp))
+        if timestamp < 10_000_000_000:
+            timestamp *= 1000
+        return cls(
+            market_type=values.get("market_type", "CRYPTO"),
+            symbol=values.get("symbol", "BTCUSDT"),
+            category=values.get("category", "USDT-FUTURES"),
+            interval=values.get("interval", "1m"),
+            open_time_ms=timestamp,
+            open=values["open"],
+            high=values["high"],
+            low=values["low"],
+            close=values["close"],
+            volume=values.get("volume", 0.0) or 0.0,
+            turnover=values.get("turnover", 0.0) or 0.0,
+            is_closed=bool(values.get("is_closed", values.get("closed", False))),
+            source=str(values.get("source", "bitget")),
+        )
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.open_time_ms,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "turnover": self.turnover,
+            "symbol": self.symbol,
+            "category": self.category,
+            "interval": self.interval,
+            "market_type": self.market_type,
+            "is_closed": self.is_closed,
+            "source": self.source,
+        }
+
 @dataclass
 class Signal:
     symbol: str

@@ -53,6 +53,20 @@ MARKET_STATE = MarketStateManager(risk_poll_seconds=20)
 CSV_COMPAT_EXPORT = os.getenv("CSV_COMPAT_EXPORT", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Keep the existing stock API contract available when no environment flag is
+# present, while the browser stays Bitget-only unless the flag is explicit.
+ENABLE_STOCK_MARKETS = _env_bool("ENABLE_STOCK_MARKETS", True)
+UI_STOCK_MARKETS = _env_bool("ENABLE_STOCK_MARKETS", False)
+ENABLE_SURGE_SCANNER = _env_bool("ENABLE_SURGE_SCANNER", False)
+
+
 def _position_count(payload: Any) -> int:
     """Count non-zero position records across provider-specific response shapes."""
     if isinstance(payload, dict):
@@ -116,6 +130,16 @@ def _normalize_category(value: Any) -> str:
 
 def _is_stock_market(market_type: str) -> bool:
     return market_type in {KOR_STOCK, US_STOCK}
+
+
+def _require_stock_feature() -> None:
+    if not ENABLE_STOCK_MARKETS:
+        raise RuntimeError("Stock markets are disabled. Set ENABLE_STOCK_MARKETS=true to enable them.")
+
+
+def _require_surge_feature() -> None:
+    if not ENABLE_SURGE_SCANNER:
+        raise RuntimeError("Surge scanner is disabled. Set ENABLE_SURGE_SCANNER=true to enable it.")
 
 
 def _stock_candle_category(market_type: str, exchange: str | None = None) -> str:
@@ -707,6 +731,17 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     eq = result["equity_curve"]
     trades = result["trades"]
     metrics = result["metrics"]
+    dataset = dict(result.get("dataset") or {})
+    if dataset.get("first_timestamp") is not None:
+        dataset.update(
+            {
+                "requested_start": start,
+                "requested_end": end or "now",
+                "actually_used_start": pd.to_datetime(int(dataset["first_timestamp"]), unit="ms").isoformat(),
+                "actually_used_end": pd.to_datetime(int(dataset["last_timestamp"]), unit="ms").isoformat(),
+                "limited": bool(len(df) >= 1000),
+            }
+        )
     return {
         "ok": True,
         "symbol": symbol,
@@ -723,7 +758,7 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "monthly": _monthly_returns(eq),
         "trades": _trade_rows(trades),
         "metrics": metrics,
-        "dataset": result.get("dataset", {}),
+        "dataset": dataset,
         "rows": int(len(df)),
         "indicators": _indicator_payload(df),
     }
@@ -731,7 +766,8 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse(HTML)
+    flags = json.dumps({"stockMarkets": UI_STOCK_MARKETS, "surgeScanner": ENABLE_SURGE_SCANNER})
+    return HTMLResponse(HTML.replace("__FEATURE_FLAGS__", flags))
 
 
 @app.get("/api/candles")
@@ -749,6 +785,8 @@ def api_candles(
     try:
         category = _normalize_category(category)
         market_type = normalize_market_type(market_type, category)
+        if market_type != CRYPTO and not ENABLE_STOCK_MARKETS:
+            raise RuntimeError("Stock markets are disabled. Set ENABLE_STOCK_MARKETS=true to enable them.")
         end = _coerce_end_date(end)
         if market_type == CRYPTO and source == "bitget":
             if interval.endswith("s"):
@@ -764,6 +802,7 @@ def api_candles(
                     df, report = load_or_fetch_candles(symbol, category, interval, start, end, limit=limit, source='bitget', repair=True, strict_backtest=False)
                     _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
         elif source == "toss":
+            _require_stock_feature()
             if interval.endswith("s"):
                 raise ValueError("Toss stock charts currently support 1m and larger intervals")
             if market_type == CRYPTO:
@@ -787,6 +826,7 @@ def api_candles(
             "market_type": market_type,
             "interval": interval,
             "rows": int(len(df)),
+            "last_timestamp": int(df["timestamp"].iloc[-1]) if not df.empty else None,
             "candles": _candles_json(df),
             "indicators": _indicator_payload(df) if include_indicators else {"overlay": {}, "lower": {}},
             "report": report.__dict__ if hasattr(report, "__dict__") else (report or {}),
@@ -803,11 +843,53 @@ def api_candles(
                 "market_type": market_type,
                 "interval": interval,
                 "rows": int(len(cached)),
+                "last_timestamp": int(cached["timestamp"].iloc[-1]) if not cached.empty else None,
                 "candles": _candles_json(cached),
                 "indicators": _indicator_payload(cached),
                 "report": {"fallback": "cache"},
             }
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.get("/api/indicators")
+def api_indicators_snapshot(
+    symbol: str = Query("BTCUSDT"),
+    category: str = Query("USDT-FUTURES"),
+    interval: str = Query("1m"),
+    market_type: str = Query(CRYPTO),
+    limit: int = Query(500, ge=50, le=6000),
+    enabled: str = Query(""),
+):
+    """Calculate indicators from the server-side bounded SQLite tail.
+
+    Live browsers no longer send the complete 6,000-candle chart back to the
+    server on every update. The POST endpoint below remains as a compatibility
+    fallback for browser-only historical data.
+    """
+    try:
+        category = _normalize_category(category)
+        market_type = normalize_market_type(market_type, category)
+        if market_type != CRYPTO and not ENABLE_STOCK_MARKETS:
+            raise RuntimeError("Stock markets are disabled on this server.")
+        df = _load_cached_range(symbol, interval, category, limit=limit, market_type=market_type)
+        if df.empty:
+            df = _load_local(symbol, interval, category, limit=limit, market_type=market_type)
+        if df.empty:
+            raise ValueError("no server-side candle data is available")
+        keys = {item.strip() for item in str(enabled or "").split(",") if item.strip()}
+        return {
+            "ok": True,
+            "symbol": symbol.upper(),
+            "category": category,
+            "market_type": market_type,
+            "interval": interval,
+            "rows": int(len(df)),
+            "last_timestamp": int(df["timestamp"].iloc[-1]),
+            "source": "sqlite",
+            "indicators": _indicator_payload(df.tail(limit), keys or None, market_type),
+        }
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
 @app.post("/api/indicators")
@@ -833,6 +915,7 @@ def api_indicators(payload: dict[str, Any] = Body(...)):
 @app.get("/api/stocks/universe/status")
 def api_stock_universe_status():
     """Return local catalog counts without contacting Toss."""
+    _require_stock_feature()
     return {"ok": True, **stock_universe_status()}
 
 
@@ -843,6 +926,7 @@ def api_stock_search(
     limit: int = Query(20, ge=1, le=100),
 ):
     try:
+        _require_stock_feature()
         market_type = normalize_market_type(market_type)
         if not _is_stock_market(market_type):
             raise ValueError("Stock search requires KOR_STOCK or US_STOCK")
@@ -863,6 +947,7 @@ def api_stock_search(
 def api_stock_select(payload: dict[str, Any] = Body(...)):
     """Select a ticker and enrich its local catalog entry from Toss when possible."""
     try:
+        _require_stock_feature()
         market_type = normalize_market_type(payload.get("market_type"))
         if not _is_stock_market(market_type):
             raise ValueError("Stock selection requires KOR_STOCK or US_STOCK")
@@ -907,6 +992,7 @@ def api_stock_universe_refresh(payload: dict[str, Any] = Body(default={})):
     universe API request each time the UI starts.
     """
     try:
+        _require_stock_feature()
         market_type = normalize_market_type(payload.get("market_type") or KOR_STOCK)
         if not _is_stock_market(market_type):
             raise ValueError("Stock universe refresh requires KOR_STOCK or US_STOCK")
@@ -933,6 +1019,8 @@ def api_surge_rankings(
 ):
     """Read the persisted local-universe price/volume watchlist without network I/O."""
     try:
+        _require_stock_feature()
+        _require_surge_feature()
         market = normalize_market_type(market_type)
         if not _is_stock_market(market):
             raise ValueError("Surge rankings require KOR_STOCK or US_STOCK")
@@ -950,6 +1038,8 @@ def api_refresh_surge_rankings(payload: dict[str, Any] = Body(default={})):
     local catalog instead of pretending that Toss exposes a global Top 100.
     """
     try:
+        _require_stock_feature()
+        _require_surge_feature()
         market = normalize_market_type(payload.get("market_type") or KOR_STOCK)
         if not _is_stock_market(market):
             raise ValueError("Surge rankings require KOR_STOCK or US_STOCK")
@@ -1013,6 +1103,8 @@ def api_market_state():
 async def api_market_switch(payload: dict[str, Any] = Body(...)):
     try:
         market_type = normalize_market_type(payload.get("market_type"))
+        if market_type != CRYPTO:
+            _require_stock_feature()
         return {"ok": True, **(await MARKET_STATE.switch_active(market_type))}
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -1139,6 +1231,10 @@ async def ws_live(websocket: WebSocket):
     category = _normalize_category(params.get("category"))
     interval = str(params.get("interval") or "1m")
     market_type = normalize_market_type(params.get("market_type"), category)
+    if market_type != CRYPTO and not ENABLE_STOCK_MARKETS:
+        await websocket.send_json({"type": "fatal", "message": "Stock markets are disabled on this server."})
+        await websocket.close()
+        return
     await MARKET_STATE.switch_active(market_type)
     current_task = asyncio.current_task()
     if not await MARKET_STATE.attach_heavy_task(market_type, current_task):
@@ -1231,7 +1327,7 @@ HTML = r"""
 <body>
 <div class="app">
   <aside class="rail"><div class="logo">B</div><div class="ico on">↗</div><div class="ico">▦</div><div class="ico">⚙</div></aside>
-  <header class="top"><span class="tab on">Backtest</span><span class="tab">Live</span><span class="tab">Indicators</span><span class="tab">Risk</span><button class="pill marketTab on" data-market="CRYPTO">Crypto</button><button class="pill marketTab" data-market="KOR_STOCK">KR Stocks</button><button class="pill marketTab" data-market="US_STOCK">US Stocks</button><span class="spacer"></span><span class="pill" id="netBadge" title="데이터 연결 상태">READY</span><button class="btn" id="runBtn">백테스트</button><button class="btn blue" id="downloadBtn">Bitget 데이터</button><button class="btn gray" id="liveBtn">실시간 OFF</button><button class="btn red" id="stopBtn">Stop</button></header>
+   <header class="top"><span class="tab on">Bitget Futures</span><button class="pill marketTab on" data-market="CRYPTO">Crypto</button><button class="pill marketTab" data-market="KOR_STOCK">KR Stocks</button><button class="pill marketTab" data-market="US_STOCK">US Stocks</button><span class="spacer"></span><span class="pill" id="netBadge" title="데이터 연결 상태">READY</span><button class="btn" id="runBtn">백테스트</button><button class="btn blue" id="downloadBtn">Bitget 데이터</button><button class="btn gray" id="liveBtn">실시간 OFF</button><button class="btn red" id="stopBtn">시장 데이터 중지</button></header>
   <aside class="left">
     <section class="panel"><h3>전략/데이터</h3><div class="box">
       <div class="grid2"><div class="field"><label>Symbol</label><input id="symbol" value="BTCUSDT"></div><div class="field"><label>Category</label><input id="category" value="USDT-FUTURES"></div></div>
@@ -1262,7 +1358,8 @@ HTML = r"""
     <section class="panel" id="surgeRankPanel" hidden><h3>Top 100 Surge Candidates</h3><div class="box"><div class="surgeRankHead"><button class="pill" id="surgeRefreshBtn" type="button">Refresh</button><span class="muted catalogMeta" id="surgeRankUpdated"></span></div><div class="muted surgeRankMeta" id="surgeRankMeta">Local catalog scope.</div><div class="surgeRankings" id="surgeRankings"></div></div></section>
     <section class="panel"><h3>성과</h3><div class="box" id="metrics"></div></section>
     <section class="panel"><h3>리스크</h3><div class="box" id="risk"></div></section>
-    <section class="panel"><h3>상태</h3><div class="box"><div class="status" id="status">대기 중</div></div></section>
+   <section class="panel"><h3>데이터 진단</h3><div class="box" id="diagnostics"><div class="metric"><span>Market data</span><b id="diagMarket">READY</b></div><div class="metric"><span>Last candle</span><b id="diagCandle">-</b></div><div class="metric"><span>WS message</span><b id="diagMessage">-</b></div><div class="metric"><span>Data lag</span><b id="diagLag">-</b></div><div class="metric"><span>Reconnects</span><b id="diagReconnects">0</b></div><div class="metric"><span>DB queue</span><b id="diagQueue">-</b></div></div></section>
+   <section class="panel"><h3>상태</h3><div class="box"><div class="status" id="status">대기 중</div></div></section>
     <section class="panel"><h3>거래 로그</h3><div class="trades"><table><thead><tr><th>Time</th><th>Side</th><th>Price</th><th>PnL</th></tr></thead><tbody id="tradeRows"></tbody></table></div></section>
   </aside>
 </div>
@@ -1273,6 +1370,8 @@ let liveSocket=null,liveWanted=false,lastPayload=null,lastIndicators={overlay:{}
 let candleRequestSeq=0, backtestRequestSeq=0, indicatorRequestSeq=0, liveSeq=0;
 let candleAbort=null, indicatorAbort=null, lastRenderMeta={symbol:'BTCUSDT', interval:'1H', source:'local', stale:false};
 let activeMarketType='CRYPTO';
+const SERVER_FEATURE_FLAGS=__FEATURE_FLAGS__;
+const liveState={connectionId:'',sequence:0,reconnectTimer:null,reconnectAttempt:0,lastMessageMs:0,reconnectCount:0};
 function pad2(n){return String(n).padStart(2,'0')}
 function chartTimeSec(t){if(typeof t==='number')return t;if(t&&typeof t==='object')return Date.UTC(t.year,(t.month||1)-1,t.day||1)/1000;return 0}
 function exchangeDateParts(sec){const d=new Date((sec+8*3600)*1000);return [d.getUTCFullYear(),pad2(d.getUTCMonth()+1),pad2(d.getUTCDate()),pad2(d.getUTCHours()),pad2(d.getUTCMinutes()),pad2(d.getUTCSeconds())]}
@@ -1304,10 +1403,19 @@ function immediateIndicators(){return {overlay:{},lower:{volume:allCandles.map(c
 function setIncomingIndicators(data){const fallback=immediateIndicators();lastIndicators={overlay:data?.overlay||{},lower:Object.keys(data?.lower||{}).length?(data.lower||{}):fallback.lower}}
 function clearTradeLevels(){for(const s of tradeLevelSeries){try{priceChart.removeSeries(s)}catch(e){}}tradeLevelSeries=[]}
 function setSeriesMarkers(rows){if(candleMarkers?.setMarkers)candleMarkers.setMarkers(rows);else candleSeries.setMarkers?.(rows)}
-function clearAllSeries(){candleSeries.setData([]);setSeriesMarkers([]);clearTradeLevels();for(const s of Object.values(overlaySeries))s.setData([]);for(const s of Object.values(lowerSeries))s.setData([]);allCandles=[];markers=[];lastIndicators={overlay:{},lower:{}}}
-function mergeCandles(a,b){const m=new Map();[...(a||[]),...(b||[])].forEach(c=>{if(c&&c.time)m.set(+c.time,{...c,time:+c.time})});return [...m.values()].sort((x,y)=>x.time-y.time)}
-function setCandles(cs,{keepOnEmpty=false}={}){const clean=(cs||[]).filter(c=>c&&c.time&&Number.isFinite(+c.open)&&Number.isFinite(+c.high)&&Number.isFinite(+c.low)&&Number.isFinite(+c.close)).sort((a,b)=>a.time-b.time);if(!clean.length&&keepOnEmpty&&allCandles.length)return false;allCandles=clean;candleSeries.setData(allCandles);return true}
-function mergeLiveCandles(cs){const beforeLast=allCandles.length?allCandles[allCandles.length-1].time:0;const visible=priceChart.timeScale().getVisibleRange?.();const follow=!!(visible&&beforeLast&&chartTimeSec(visible.to)>=beforeLast-intervalSec()*2);const merged=mergeCandles(allCandles,cs).slice(-6000);if(!setCandles(merged,{keepOnEmpty:true}))return false;const afterLast=allCandles.length?allCandles[allCandles.length-1].time:beforeLast;try{if(visible&&follow&&afterLast>beforeLast){const shift=afterLast-beforeLast;priceChart.timeScale().setVisibleRange({from:chartTimeSec(visible.from)+shift,to:chartTimeSec(visible.to)+shift})}else if(visible){priceChart.timeScale().setVisibleRange(visible)}}catch(e){}return true}
+ const candleStore={
+   rows:[], index:new Map(), maxRows:6000,
+   normalize(c){if(!c||!Number.isFinite(+c.time)||!Number.isFinite(+c.open)||!Number.isFinite(+c.high)||!Number.isFinite(+c.low)||!Number.isFinite(+c.close))return null;return {...c,time:+c.time,open:+c.open,high:+c.high,low:+c.low,close:+c.close,volume:+c.volume||0}},
+   replaceAll(cs){const merged=new Map();for(const raw of (cs||[])){const c=this.normalize(raw);if(c)merged.set(c.time,c)}this.rows.length=0;this.rows.push(...[...merged.values()].sort((a,b)=>a.time-b.time).slice(-this.maxRows));this.index=new Map(this.rows.map(c=>[c.time,c]))},
+   apply(raw){const c=this.normalize(raw);if(!c)return {action:'ignored',evicted:false};const last=this.rows[this.rows.length-1];if(!last){this.rows.push(c);this.index.set(c.time,c);return {action:'inserted',evicted:false}}if(c.time===last.time){this.rows[this.rows.length-1]=c;this.index.set(c.time,c);return {action:'updated',evicted:false}}if(c.time>last.time){const evicted=this.rows.length>=this.maxRows;if(evicted)this.index.delete(this.rows[0].time);this.rows.push(c);if(this.rows.length>this.maxRows)this.rows.shift();this.index.set(c.time,c);return {action:'inserted',evicted}}const merged=new Map(this.rows.map(item=>[item.time,item]));merged.set(c.time,c);this.rows.length=0;this.rows.push(...[...merged.values()].sort((a,b)=>a.time-b.time).slice(-this.maxRows));this.index=new Map(this.rows.map(item=>[item.time,item]));return {action:'historical_patch',evicted:false}},
+   last(){return this.rows[this.rows.length-1]||null}
+ };
+ allCandles=candleStore.rows;
+ function clearAllSeries(){candleSeries.setData([]);setSeriesMarkers([]);clearTradeLevels();for(const s of Object.values(overlaySeries))s.setData([]);for(const s of Object.values(lowerSeries))s.setData([]);candleStore.replaceAll([]);allCandles=candleStore.rows;markers=[];lastIndicators={overlay:{},lower:{}}}
+ function mergeCandles(a,b){const m=new Map();[...(a||[]),...(b||[])].forEach(c=>{const clean=candleStore.normalize(c);if(clean)m.set(clean.time,clean)});return [...m.values()].sort((x,y)=>x.time-y.time)}
+ function setCandles(cs,{keepOnEmpty=false}={}){const clean=(cs||[]).map(c=>candleStore.normalize(c)).filter(Boolean);if(!clean.length&&keepOnEmpty&&allCandles.length)return false;candleStore.replaceAll(clean);allCandles=candleStore.rows;candleSeries.setData(allCandles);return true}
+ function mergeLiveCandles(cs){const beforeLast=allCandles.length?allCandles[allCandles.length-1].time:0;const visible=priceChart.timeScale().getVisibleRange?.();const follow=!!(visible&&beforeLast&&chartTimeSec(visible.to)>=beforeLast-intervalSec()*2);const merged=mergeCandles(allCandles,cs).slice(-6000);if(!setCandles(merged,{keepOnEmpty:true}))return false;const afterLast=allCandles.length?allCandles[allCandles.length-1].time:beforeLast;try{if(visible&&follow&&afterLast>beforeLast){const shift=afterLast-beforeLast;priceChart.timeScale().setVisibleRange({from:chartTimeSec(visible.from)+shift,to:chartTimeSec(visible.to)+shift})}else if(visible){priceChart.timeScale().setVisibleRange(visible)}}catch(e){}return true}
+ function applyRealtimeCandle(c){const result=candleStore.apply(c);if(result.action==='ignored')return result;allCandles=candleStore.rows;if(result.evicted||result.action==='historical_patch')candleSeries.setData(allCandles);else candleSeries.update(candleStore.last());updateLiveLower(candleStore.last());if(result.action==='inserted'||result.candleClosed) scheduleIndicatorRefresh(80);return result}
 function filterMarkers(ms){if(!allCandles.length)return [];const lo=allCandles[0].time,hi=allCandles[allCandles.length-1].time;const filtered=(ms||[]).filter(m=>m.time>=lo&&m.time<=hi).slice(-180);const dense=filtered.length>80;return filtered.map(m=>dense?{...m,text:m.side==='buy'?'B':'S'}:m)}
 function setMarkers(ms=[]){markers=ms||[];setSeriesMarkers(filterMarkers(markers).map(m=>({time:m.time,position:m.position,color:m.color,shape:m.shape,text:m.text})))}
 
@@ -1402,46 +1510,17 @@ async function loadCandles(source=sourceForInterval(), opts={}){
     setNetBadge('ERROR',e.message);setStatus('Candle load error: '+e.message);toast(e.message,true);
   }
 }
-function startLive(){
-  liveWanted=true;closeLive(false);syncToday();refreshTitle();
-  const seq=++liveSeq;const p=payload(sourceForInterval());
-  const chartLastTime=allCandles.length?allCandles[allCandles.length-1].time:0;
-  const q=new URLSearchParams({symbol:p.symbol,category:p.category,market_type:p.market_type,interval:p.interval,engine:'auto',from:String(chartLastTime)});
-  const proto=location.protocol==='https:'?'wss':'ws';
-  liveSocket=new WebSocket(`${proto}://${location.host}/ws/live?${q}`);
-  $('liveBtn').textContent='Live ON';setNetBadge('LOADING','Live WebSocket connecting');setStatus('Live WebSocket connecting...');
-  liveSocket.onmessage=e=>{
-    if(seq!==liveSeq)return;
-    const d=JSON.parse(e.data);
-    if(d.type==='catchup'){
-      if(mergeLiveCandles(d.candles||[])){
-        lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};
-        scheduleIndicatorRefresh(25);
-      }
-      setNetBadge('LOADING','Filling chart gap');setStatus(`Live gap repair\nrows=${d.rows}\nfetched1m=${d.report?.fetched_1m||0}`);
-    }else if(d.type==='snapshot'){
-      const hadCandles=allCandles.length>0;
-      if(mergeLiveCandles(d.candles||[])){
-        if(!hadCandles)setIncomingIndicators(d.indicators);
-        lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};
-        if(!hadCandles)priceChart.timeScale().fitContent();
-        applyIndicators();syncPaneRanges();scheduleIndicatorRefresh(25);
-      }
-      setNetBadge('LIVE','Exchange Kline stream connected');setStatus(`Live connected\nrows=${d.rows}\nchart preserved=${hadCandles}`);
-    }else if(d.type==='candle_update'){
-      if(!d.candle||d.candle.time<1)return;
-      mergeLiveCandles([d.candle]);updateLiveLower(d.candle);syncPaneRanges();
-      setNetBadge('LIVE','Current exchange candle updating');
-      setStatus(`Live update\n${p.symbol} ${p.interval}\nlast=${formatChartTime(d.candle.time)}\ntransport=${d.transport||'websocket'}`);
-    }else if(d.type==='status'){
-      setNetBadge('STALE',d.message||'reconnecting');setStatus(`${d.transport||'live'}\n${d.message||''}`);
-    }else if(d.type==='fatal'){
-      setNetBadge('ERROR',d.message);toast(d.message,true);
-    }
-  };
-  liveSocket.onclose=()=>{if(seq===liveSeq){liveSocket=null;$('liveBtn').textContent=liveWanted?'Reconnecting':'Live OFF';setNetBadge('STALE','Live connection closed')}};
-  liveSocket.onerror=()=>{setNetBadge('STALE','WebSocket temporary error')};
-}
+ function updateDiagnostics(d={}){const now=Date.now();const last=d.candle?.time?Number(d.candle.time)*1000:liveState.lastCandleMs||0;if(last)liveState.lastCandleMs=last;if(d.server_time_ms)liveState.lastMessageMs=Number(d.server_time_ms);if($('diagMarket'))$('diagMarket').textContent=liveWanted?(d.type==='status'?'STALE':'LIVE'):'READY';if($('diagCandle'))$('diagCandle').textContent=last?formatChartTime(last/1000):'-';if($('diagMessage'))$('diagMessage').textContent=liveState.lastMessageMs?new Date(liveState.lastMessageMs).toLocaleTimeString():'-';if($('diagLag'))$('diagLag').textContent=last?`${Math.max(0,Math.round((now-last)/1000))}s`:'-';if($('diagReconnects'))$('diagReconnects').textContent=String(d.reconnect_count??liveState.reconnectCount??0);if($('diagQueue'))$('diagQueue').textContent=d.db_queue_depth===undefined?'-':String(d.db_queue_depth)}
+ function acceptLiveEvent(d){if(d.connection_id&&d.connection_id!==liveState.connectionId){liveState.connectionId=d.connection_id;liveState.sequence=0}if(d.sequence&&d.connection_id===liveState.connectionId&&d.sequence<=liveState.sequence)return false;if(d.sequence)liveState.sequence=d.sequence;liveState.lastMessageMs=Number(d.server_time_ms||Date.now());updateDiagnostics(d);return true}
+ function scheduleLiveReconnect(){if(!liveWanted||liveState.reconnectTimer)return;const delay=Math.min(30000,1000*Math.pow(2,Math.min(5,liveState.reconnectAttempt++)))+Math.round(Math.random()*500);setNetBadge('STALE',`Live reconnect in ${Math.ceil(delay/1000)}s`);liveState.reconnectTimer=setTimeout(()=>{liveState.reconnectTimer=null;startLive()},delay)}
+ function startLive(){
+   liveWanted=true;if(liveState.reconnectTimer){clearTimeout(liveState.reconnectTimer);liveState.reconnectTimer=null}closeLive(false);syncToday();refreshTitle();
+   const seq=++liveSeq;const p=payload(sourceForInterval());const chartLastTime=allCandles.length?allCandles[allCandles.length-1].time:0;
+   const q=new URLSearchParams({symbol:p.symbol,category:p.category,market_type:p.market_type,interval:p.interval,engine:'auto',from:String(chartLastTime)});const proto=location.protocol==='https:'?'wss':'ws';liveSocket=new WebSocket(`${proto}://${location.host}/ws/live?${q}`);
+   $('liveBtn').textContent='Live ON';setNetBadge('LOADING','Live WebSocket connecting');setStatus('Live WebSocket connecting...');
+   liveSocket.onmessage=e=>{if(seq!==liveSeq)return;const d=JSON.parse(e.data);if(!acceptLiveEvent(d))return;if(d.type==='catchup'){if(mergeLiveCandles(d.candles||[])){lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};scheduleIndicatorRefresh(25)}setNetBadge('LOADING','Filling chart gap');setStatus(`Live gap repair\nrows=${d.rows}\nfetched1m=${d.report?.fetched_1m||0}`)}else if(d.type==='snapshot'){const hadCandles=allCandles.length>0;if(mergeLiveCandles(d.candles||[])){if(!hadCandles)setIncomingIndicators(d.indicators);lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};if(!hadCandles)priceChart.timeScale().fitContent();applyIndicators();syncPaneRanges();scheduleIndicatorRefresh(25)}liveState.reconnectAttempt=0;setNetBadge('LIVE','Exchange Kline stream connected');setStatus(`Live connected\nrows=${d.rows}\nchart preserved=${hadCandles}`)}else if(d.type==='candle_update'){if(!d.candle||d.candle.time<1)return;applyRealtimeCandle(d.candle);syncPaneRanges();setNetBadge('LIVE','Current exchange candle updating');setStatus(`Live update\n${p.symbol} ${p.interval}\nlast=${formatChartTime(d.candle.time)}\ntransport=${d.transport||'websocket'}`)}else if(d.type==='status'){liveState.reconnectCount=Number(d.reconnect_count||liveState.reconnectCount);setNetBadge('STALE',d.message||'reconnecting');setStatus(`${d.transport||'live'}\n${d.message||''}`);updateDiagnostics(d)}else if(d.type==='fatal'){setNetBadge('ERROR',d.message);toast(d.message,true)}};
+   liveSocket.onclose=()=>{if(seq===liveSeq){liveSocket=null;$('liveBtn').textContent=liveWanted?'Reconnecting':'Live OFF';if(liveWanted)scheduleLiveReconnect();else setNetBadge('READY','Live stopped')}};liveSocket.onerror=()=>{setNetBadge('STALE','WebSocket temporary error')};
+ }
 function normalizeCategory(value){const text=String(value||'USDT-FUTURES').trim().toUpperCase();return {"USDT-FUTURE":"USDT-FUTURES","USDC-FUTURE":"USDC-FUTURES","COIN-FUTURE":"COIN-FUTURES"}[text]||text}
 function payload(source='local'){syncToday();const category=normalizeCategory($('category').value);$('category').value=category;return {symbol:$('symbol').value.trim().toUpperCase(),category,market_type:activeMarketType,interval:$('interval').value,strategy:$('strategy').value,initialCash:+$('initialCash').value,feeRate:+$('feeRate').value,slippageRate:+$('slippageRate').value,allowShort:$('allowShort').value==='true',source,start:$('start').value,end:$('end').value,minRelVolume:+$('minRelVolume').value,minAtrPct:+$('minAtrPct').value,stopAtr:+$('stopAtr').value,takeAtr:+$('takeAtr').value,volumeMult:Number($('volumeMult')?.value||1.8),pullbackBars:Number($('pullbackBars')?.value||13),fast:20,slow:60}}
 function setStatus(value){$('status').textContent=value}
@@ -1451,12 +1530,12 @@ function toast(message,bad=false){const node=$('toast');node.textContent=message
 function fmt(value,precision=2){if(value===undefined||value===null||Number.isNaN(+value))return '-';return (+value).toLocaleString(undefined,{maximumFractionDigits:precision})}
 function renderMetrics(metrics={}){const rows=[['Initial cash',metrics.initial_cash],['Final equity',metrics.final_equity],['Return',metrics.total_return===undefined?'-':metrics.total_return+'%'],['MDD',metrics.mdd===undefined?'-':metrics.mdd+'%'],['Sharpe',metrics.sharpe],['Win rate',metrics.win_rate===undefined?'-':metrics.win_rate+'%'],['Profit factor',metrics.profit_factor],['Trades',metrics.trade_count]];$('metrics').innerHTML=rows.map(([name,value])=>`<div class="metric"><span>${name}</span><b>${value??'-'}</b></div>`).join('');$('risk').innerHTML='<div class="metric"><span>Live orders</span><b class="red">Blocked by default</b></div><div class="metric"><span>Inactive markets</span><b>REST risk polling only when positioned</b></div>'}
 function renderTrades(rows=[]){$('tradeRows').innerHTML=rows.map(row=>`<tr><td>${row.date||''}</td><td class="${row.side==='buy'?'green':'red'}">${row.side||''}</td><td>${fmt(row.price)}</td><td class="${row.pnl>=0?'green':'red'}">${fmt(row.pnl)}</td></tr>`).join('')}
-function renderResult(data){olderLoadArmed=false;lastPayload=data;if(!setCandles(data.candles||[],{keepOnEmpty:true})){toast('No candles available for backtest',true);return}setMarkers(data.markers||[]);setTradeLevels(data.tradeLevels||[]);lastIndicators=data.indicators||{overlay:{},lower:{}};applyIndicators();renderMetrics(data.metrics||{});renderTrades(data.trades||[]);$('titleSym').textContent=`${data.symbol} ${data.interval}`;priceChart.timeScale().fitContent();syncPaneRanges();setStatus(`Backtest complete\nrows=${data.rows}\nstrategy=${$('strategy').value}`)}
+ function renderResult(data){olderLoadArmed=false;lastPayload=data;if(!setCandles(data.candles||[],{keepOnEmpty:true})){toast('No candles available for backtest',true);return}setMarkers(data.markers||[]);setTradeLevels(data.tradeLevels||[]);lastIndicators=data.indicators||{overlay:{},lower:{}};applyIndicators();renderMetrics(data.metrics||{});renderTrades(data.trades||[]);$('titleSym').textContent=`${data.symbol} ${data.interval}`;priceChart.timeScale().fitContent();syncPaneRanges();const ds=data.dataset||{};setStatus(`Backtest complete\nrows=${data.rows}\nstrategy=${$('strategy').value}\nrequested=${ds.requested_start||'-'} ~ ${ds.requested_end||'-'}\nused=${ds.actually_used_start||'-'} ~ ${ds.actually_used_end||'-'}\nlimited=${ds.limited?'true':'false'}`)}
 async function runBacktest(source='local'){closeLive();syncToday();const seq=++backtestRequestSeq;setNetBadge('LOADING','Backtest running');setStatus('Backtest running...');try{const request=payload(source);const response=await fetch('/api/backtest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});const data=await response.json();if(seq!==backtestRequestSeq)return;if(!data.ok)throw Error(data.error||'backtest failed');if(!sameResponseContext(data,request))return;renderResult(data);toast('Backtest complete')}catch(error){if(seq!==backtestRequestSeq)return;setNetBadge('ERROR',error.message);setStatus('Backtest error: '+error.message);toast(error.message,true)}}
-function updateLiveLower(candle){ensureSeries();if(document.querySelector('[data-lower="volume"]')?.checked&&lowerSeries.volume){const up=candle.close>=candle.open;lowerSeries.volume.update({time:candle.time,value:candle.volume||0,color:up?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'})}scheduleIndicatorRefresh()}
-async function recomputeIndicatorsFromCandles(){if(!allCandles.length)return;const seq=++indicatorRequestSeq;try{if(indicatorAbort)indicatorAbort.abort();indicatorAbort=new AbortController();const request=payload(sourceForInterval());const response=await fetch('/api/indicators',{method:'POST',headers:{'content-type':'application/json'},signal:indicatorAbort.signal,body:JSON.stringify({symbol:request.symbol,category:request.category,market_type:request.market_type,interval:request.interval,candles:allCandles.slice(-6000),enabled:enabledIndicatorKeys()})});const data=await response.json();if(seq!==indicatorRequestSeq)return;if(data.ok&&sameResponseContext(data,request)){setIncomingIndicators(data.indicators);applyIndicators();setNetBadge(lastRenderMeta.stale?'STALE':'READY',lastRenderMeta.stale?'Cached chart data':'Indicators refreshed')}}catch(error){if(error.name!=='AbortError')setNetBadge('STALE','Indicator refresh delayed: '+error.message)}}
+function updateLiveLower(candle){ensureSeries();if(document.querySelector('[data-lower="volume"]')?.checked&&lowerSeries.volume){const up=candle.close>=candle.open;lowerSeries.volume.update({time:candle.time,value:candle.volume||0,color:up?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'})}}
+async function recomputeIndicatorsFromCandles(){if(!allCandles.length)return;const seq=++indicatorRequestSeq;try{if(indicatorAbort)indicatorAbort.abort();indicatorAbort=new AbortController();const request=payload(sourceForInterval());const query=new URLSearchParams({symbol:request.symbol,category:request.category,market_type:request.market_type,interval:request.interval,limit:String(Math.min(500,chartLimit())),enabled:enabledIndicatorKeys().join(',')});const response=await fetch('/api/indicators?'+query,{signal:indicatorAbort.signal});const data=await response.json();if(seq!==indicatorRequestSeq)return;if(!data.ok)throw Error(data.error||'indicator snapshot failed');if(sameResponseContext(data,request)){setIncomingIndicators(data.indicators);applyIndicators();setNetBadge(lastRenderMeta.stale?'STALE':'READY',lastRenderMeta.stale?'Cached chart data':'Indicators refreshed')}}catch(error){if(error.name!=='AbortError')setNetBadge('STALE','Indicator refresh delayed: '+error.message)}}
 function scheduleIndicatorRefresh(delay=1800){clearTimeout(indicatorTimer);indicatorTimer=setTimeout(recomputeIndicatorsFromCandles,delay)}
-function closeLive(manual=true){if(manual)liveWanted=false;liveSeq++;if(liveSocket){try{liveSocket.close()}catch(error){}liveSocket=null}$('liveBtn').textContent=liveWanted?'Reconnecting':'Live OFF';if(!liveWanted)setNetBadge('READY','Live stopped')}
+ function closeLive(manual=true){if(manual){liveWanted=false;if(liveState.reconnectTimer){clearTimeout(liveState.reconnectTimer);liveState.reconnectTimer=null}}liveSeq++;if(liveSocket){try{liveSocket.close()}catch(error){}liveSocket=null}$('liveBtn').textContent=liveWanted?'Reconnecting':'Live OFF';if($('diagMarket')&&!liveWanted)$('diagMarket').textContent='READY';if(!liveWanted)setNetBadge('READY','Live stopped')}
 function resize(){priceChart.applyOptions({width:$('priceChart').clientWidth,height:$('priceChart').clientHeight});sizePanes();syncPaneRanges()}
 async function setIntervalAndLoad(value){if(activeMarketType!=='CRYPTO'&&value.endsWith('s'))value='1m';document.querySelectorAll('[data-range]').forEach(node=>node.classList.toggle('on',node.dataset.range===value));$('interval').value=value;refreshTitle();const keep=liveWanted||!!liveSocket;if(keep){closeLive(false);await loadCandles(sourceForInterval(),{keepLive:true});startLive()}else{await loadCandles(sourceForInterval())}}
 async function maybeLoadOlder(r){if(!olderLoadArmed||loadingOlder||liveSocket||!allCandles.length||$('interval').value.endsWith('s'))return;const threshold=allCandles[Math.min(50,allCandles.length-1)].time;if(r.from>threshold)return;loadingOlder=true;try{const keepRange=priceChart.timeScale().getVisibleRange?.();const first=allCandles[0].time;const bars=olderLimit();const endSec=first-intervalSec();const startSec=endSec-intervalSec()*bars;const source=sourceForInterval();const request=payload(source);const query=new URLSearchParams({symbol:request.symbol,category:request.category,market_type:request.market_type,interval:request.interval,source,start:isoUtc(startSec),end:isoUtc(endSec),limit:String(bars)});const response=await fetch('/api/candles?'+query);const data=await response.json();if(data.ok&&sameResponseContext(data,request)&&data.candles?.length){lastRenderMeta={symbol:request.symbol,interval:request.interval,source,stale:!!data.stale};setCandles(mergeCandles(data.candles,allCandles),{keepOnEmpty:true});await recomputeIndicatorsFromCandles();if(keepRange)priceChart.timeScale().setVisibleRange(keepRange);setMarkers(markers);setNetBadge(data.stale?'STALE':'READY',data.stale?'Cached history shown':'Older candles loaded')}}catch(error){setNetBadge('STALE','Older candle load delayed: '+error.message)}finally{setTimeout(()=>loadingOlder=false,1800)}}
@@ -1472,20 +1551,21 @@ var stockSearchTimer=null,stockSearchAbort=null;
 var marketSelections={KOR_STOCK:{symbol:'005930',category:'KRX'},US_STOCK:{symbol:'AAPL',category:'NASDAQ'}};
 var surgeRankingTimer=null,surgeRankingAbort=null,surgeRefreshPending=false;
 function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}
-function stockMarketActive(){return activeMarketType==='KOR_STOCK'||activeMarketType==='US_STOCK'}
+ function applyFeatureFlags(){if(!SERVER_FEATURE_FLAGS.stockMarkets){document.querySelectorAll('.marketTab[data-market="KOR_STOCK"],.marketTab[data-market="US_STOCK"]').forEach(node=>node.remove());$('stockSearchPanel').hidden=true;$('surgePanel').hidden=true;$('surgeRankPanel').hidden=true}}
+ function stockMarketActive(){return SERVER_FEATURE_FLAGS.stockMarkets&&(activeMarketType==='KOR_STOCK'||activeMarketType==='US_STOCK')}
 function rememberMarketSelection(){if(stockMarketActive()){marketSelections[activeMarketType]={symbol:$('symbol').value.trim().toUpperCase(),category:normalizeCategory($('category').value)}}}
 function stopSurgeRankingPolling(){if(surgeRankingTimer){clearInterval(surgeRankingTimer);surgeRankingTimer=null}if(surgeRankingAbort){surgeRankingAbort.abort();surgeRankingAbort=null}surgeRefreshPending=false}
 function surgeNumber(value,digits=2){const number=Number(value);return Number.isFinite(number)?number.toFixed(digits):'-'}
 function renderSurgeRankings(data={}){const meta=$('surgeRankMeta'),rows=$('surgeRankings'),updated=$('surgeRankUpdated');if(!meta||!rows)return;const total=Number(data.catalog_total||0),scanned=Number(data.cycle_scanned||0),batch=Number(data.scanned_this_run||0);const scope=data.is_global_universe?'Full market universe':'Local catalog only';meta.textContent=scope+' | coverage '+scanned+'/'+total+' | latest batch '+batch+(data.cycle_complete?' | cycle complete':' | rotating');updated.textContent=data.last_run_at?new Date(Number(data.last_run_at)).toLocaleTimeString():'Not scanned';const items=(data.rankings||[]).map((row,index)=>{const metrics=row.metrics||{};const name=row.name||row.name_en||row.symbol;const move=surgeNumber(metrics.price_change_5_pct,2);const volume=surgeNumber(metrics.relative_volume20,2);return '<button class="surgeRankRow" type="button" data-surge-symbol="'+escapeHtml(row.symbol)+'" data-surge-exchange="'+escapeHtml(row.exchange||'')+'"><b>#'+String(index+1)+'</b><span><b>'+escapeHtml(row.symbol)+'</b><small>'+escapeHtml(name)+'</small><small>5 bar '+move+'% | volume '+volume+'x</small></span><span class="surgeRankScore">'+surgeNumber(row.score,2)+'<small>score</small></span></button>'});rows.innerHTML=items.length?items.join(''):'<div class="emptySearch">No ranked candidates yet. Each symbol needs 20 regular-session 1m candles.</div>';rows.querySelectorAll('[data-surge-symbol]').forEach(button=>button.onclick=()=>selectStock({symbol:button.dataset.surgeSymbol,exchange:button.dataset.surgeExchange,name:button.dataset.surgeSymbol}))}
-async function loadSurgeRankings(refresh=false){if(!stockMarketActive()||surgeRefreshPending)return;if(surgeRankingAbort)surgeRankingAbort.abort();surgeRankingAbort=new AbortController();surgeRefreshPending=refresh;try{let response;if(refresh){response=await fetch('/api/stocks/surge-rankings/refresh',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:activeMarketType,max_symbols:25,top_n:100}),signal:surgeRankingAbort.signal})}else{response=await fetch('/api/stocks/surge-rankings?'+new URLSearchParams({market_type:activeMarketType,limit:'100'}),{signal:surgeRankingAbort.signal})}const data=await response.json();if(!data.ok)throw Error(data.error||'surge scan failed');if(data.market_type!==activeMarketType)return;renderSurgeRankings(data)}catch(error){if(error.name!=='AbortError'){$('surgeRankMeta').textContent='Surge scan unavailable: '+error.message}}finally{surgeRefreshPending=false;if(surgeRankingAbort?.signal.aborted===false)surgeRankingAbort=null}}
+ async function loadSurgeRankings(refresh=false){if(!SERVER_FEATURE_FLAGS.surgeScanner||!stockMarketActive()||surgeRefreshPending)return;if(surgeRankingAbort)surgeRankingAbort.abort();surgeRankingAbort=new AbortController();surgeRefreshPending=refresh;try{let response;if(refresh){response=await fetch('/api/stocks/surge-rankings/refresh',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:activeMarketType,max_symbols:25,top_n:100}),signal:surgeRankingAbort.signal})}else{response=await fetch('/api/stocks/surge-rankings?'+new URLSearchParams({market_type:activeMarketType,limit:'100'}),{signal:surgeRankingAbort.signal})}const data=await response.json();if(!data.ok)throw Error(data.error||'surge scan failed');if(data.market_type!==activeMarketType)return;renderSurgeRankings(data)}catch(error){if(error.name!=='AbortError'){$('surgeRankMeta').textContent='Surge scan unavailable: '+error.message}}finally{surgeRefreshPending=false;if(surgeRankingAbort?.signal.aborted===false)surgeRankingAbort=null}}
 function startSurgeRankingPolling(){stopSurgeRankingPolling();if(!stockMarketActive())return;loadSurgeRankings(true);surgeRankingTimer=setInterval(()=>loadSurgeRankings(true),60000)}
 function renderStockSearch(data={}){const results=$('stockSearchResults');if(!results)return;const rows=data.results||[];const query=String(data.query||'').trim();const items=rows.map(row=>'<button class="symbolResult" type="button" data-stock-symbol="'+escapeHtml(row.symbol)+'" data-stock-exchange="'+escapeHtml(row.exchange)+'" data-stock-name="'+escapeHtml(row.name||row.name_en||row.symbol)+'"><b>'+escapeHtml(row.symbol)+'</b><span><small>'+escapeHtml(row.name||row.name_en||row.symbol)+'</small><small>'+escapeHtml(row.exchange)+' | '+escapeHtml(row.currency||'')+'</small></span><small>'+escapeHtml(row.status||'')+'</small></button>');if(!items.length&&data.direct_entry){items.push('<button class="symbolResult" type="button" data-stock-symbol="'+escapeHtml(data.direct_entry)+'" data-stock-exchange="" data-stock-name="'+escapeHtml(data.direct_entry)+'"><b>'+escapeHtml(data.direct_entry)+'</b><span><small>Open manually entered ticker</small><small>Provider metadata pending</small></span><small>open</small></button>')}results.innerHTML=items.length?items.join(''):'<div class="emptySearch">'+(query?'No local match. A valid ticker can be opened directly.':'No local stock catalog yet. Import it after the approved Toss symbol API is configured.')+'</div>';results.querySelectorAll('[data-stock-symbol]').forEach(button=>button.onclick=()=>selectStock({symbol:button.dataset.stockSymbol,exchange:button.dataset.stockExchange,name:button.dataset.stockName}))}
 async function searchStockSymbols(query=$('stockSearch')?.value||''){if(!stockMarketActive())return;if(stockSearchAbort)stockSearchAbort.abort();stockSearchAbort=new AbortController();try{const response=await fetch('/api/stocks/search?'+new URLSearchParams({market_type:activeMarketType,q:query,limit:'30'}),{signal:stockSearchAbort.signal});const data=await response.json();if(!data.ok)throw Error(data.error||'stock search failed');if(data.market_type!==activeMarketType)return;const counts=data.universe?.markets?.[activeMarketType]||{};$('stockUniverseMeta').textContent='Local catalog: '+(counts.total||0)+' symbols, verified tradeable: '+(counts.tradeable||0)+'. Provider import is explicit and is not triggered by chart loading.';renderStockSearch(data)}catch(error){if(error.name!=='AbortError'){$('stockUniverseMeta').textContent='Stock search unavailable: '+error.message}}}
 async function selectStock(stock){if(!stockMarketActive())return;closeLive(true);try{const response=await fetch('/api/stocks/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:activeMarketType,symbol:stock.symbol,exchange:stock.exchange||undefined,name:stock.name||undefined})});const data=await response.json();if(!data.ok)throw Error(data.error||'stock selection failed');$('symbol').value=data.symbol;$('category').value=data.category;marketSelections[activeMarketType]={symbol:data.symbol,category:data.category};$('stockSearch').value=data.symbol;refreshTitle();await loadCandles(sourceForInterval());setStatus('Selected '+data.symbol+' '+data.category+'\nCache-first candle loading is active.\nOnly missing regular-session candles will be requested when Toss data is configured.')}catch(error){setNetBadge('ERROR',error.message);setStatus('Stock selection error: '+error.message);toast(error.message,true)}}
-function updateStockPanels(){const stock=stockMarketActive();$('stockSearchPanel').hidden=!stock;$('surgePanel').hidden=!stock;$('surgeRankPanel').hidden=!stock;priceChart.applyOptions({localization:{timeFormatter:formatChartTime},timeScale:{tickMarkFormatter:formatChartTime}});if(!stock){stopSurgeRankingPolling();return}const placeholder=activeMarketType==='KOR_STOCK'?'Search name or 6-digit ticker':'Search company or US ticker';$('stockSearch').placeholder=placeholder;searchStockSymbols($('stockSearch').value);startSurgeRankingPolling()}
+ function updateStockPanels(){const stock=stockMarketActive();const surge=stock&&SERVER_FEATURE_FLAGS.surgeScanner;$('stockSearchPanel').hidden=!stock;$('surgePanel').hidden=!surge;$('surgeRankPanel').hidden=!surge;priceChart.applyOptions({localization:{timeFormatter:formatChartTime},timeScale:{tickMarkFormatter:formatChartTime}});if(!stock){stopSurgeRankingPolling();return}const placeholder=activeMarketType==='KOR_STOCK'?'Search name or 6-digit ticker':'Search company or US ticker';$('stockSearch').placeholder=placeholder;searchStockSymbols($('stockSearch').value);if(surge)startSurgeRankingPolling()}
 function setMarketDefaults(market){const isCrypto=market==='CRYPTO';if(market==='CRYPTO'){$('symbol').value='BTCUSDT';$('category').value='USDT-FUTURES'}else{const selected=marketSelections[market]||{symbol:market==='KOR_STOCK'?'005930':'AAPL',category:market==='KOR_STOCK'?'KRX':'NASDAQ'};$('symbol').value=selected.symbol;$('category').value=selected.category}if(!isCrypto&&$('interval').value.endsWith('s'))$('interval').value='1m';document.querySelectorAll('.marketTab').forEach(button=>button.classList.toggle('on',button.dataset.market===market));refreshTitle();updateStockPanels()}
-async function switchMarket(market){if(market===activeMarketType)return;rememberMarketSelection();closeLive(true);setNetBadge('LOADING','Switching market resources');try{const response=await fetch('/api/market/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:market})});const data=await response.json();if(!data.ok)throw Error(data.error||'market switch failed');activeMarketType=market;setMarketDefaults(market);await loadCandles(sourceForInterval());setStatus('Market active: '+market+'\nInactive streams disconnected\nRisk polling remains only for open positions')}catch(error){setNetBadge('ERROR',error.message);setStatus('Market switch error: '+error.message);toast(error.message,true)}}
-updateStockPanels();
+ async function switchMarket(market){if(market!== 'CRYPTO'&&!SERVER_FEATURE_FLAGS.stockMarkets)return;if(market===activeMarketType)return;rememberMarketSelection();closeLive(true);setNetBadge('LOADING','Switching market resources');try{const response=await fetch('/api/market/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:market})});const data=await response.json();if(!data.ok)throw Error(data.error||'market switch failed');activeMarketType=market;setMarketDefaults(market);await loadCandles(sourceForInterval());setStatus('Market active: '+market+'\nInactive streams disconnected\nRisk polling remains only for open positions')}catch(error){setNetBadge('ERROR',error.message);setStatus('Market switch error: '+error.message);toast(error.message,true)}}
+ applyFeatureFlags();updateStockPanels();
 $('stockSearch').oninput=()=>{clearTimeout(stockSearchTimer);stockSearchTimer=setTimeout(()=>searchStockSymbols(),180)};
 $('stockSearchBtn').onclick=()=>searchStockSymbols();
 $('surgeRefreshBtn').onclick=()=>loadSurgeRankings(true);

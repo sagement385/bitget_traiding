@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -11,7 +13,9 @@ import pandas as pd
 from src.bitget.public_client import BitgetPublicClient, normalize_bitget_candles
 from src.bitget.websocket_client import PUBLIC_WS, candle_topic
 from src.data_engine.canonical import aggregate_from_1m, bucket_start_ms
+from src.data_engine.candle_store import CandleStore
 from src.data_engine.storage import save_csv, upsert_candles
+from src.data_engine.write_buffer import CandleWriteBuffer
 
 try:
     import websockets
@@ -29,6 +33,7 @@ class StreamConfig:
     initial_limit: int = 1000
     fallback_poll_sec: float = 5.0
     max_rows: int = 6000
+    market_type: str = "CRYPTO"
 
 
 def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame, max_rows: int = 5000) -> pd.DataFrame:
@@ -63,8 +68,20 @@ class LiveCandleStream:
         self.config = config
         self.public = BitgetPublicClient()
         self.cache = pd.DataFrame()
+        self.store = CandleStore(
+            symbol=config.symbol,
+            category=config.category,
+            interval=config.interval,
+            market_type=config.market_type,
+            max_rows=config.max_rows,
+        )
+        self.writer = CandleWriteBuffer()
         self.last_emit_ts = 0
         self.last_status = "init"
+        self.connection_id = ""
+        self.sequence = 0
+        self.reconnect_count = 0
+        self.last_message_ms = 0
 
     def _save(self) -> None:
         if self.config.write_csv and self.config.cache_path and not self.cache.empty:
@@ -78,7 +95,9 @@ class LiveCandleStream:
         limit = min(max(50, int(self.config.initial_limit)), 1000)
         df = self.public.get_recent_candles(self.config.symbol, self.config.category, self.config.interval, limit=limit)
         seed = cached if cached is not None and not cached.empty else self.cache
-        self.cache = merge_candle_frames(seed, df, max_rows=self.config.max_rows)
+        initial = merge_candle_frames(seed, df, max_rows=self.config.max_rows)
+        self.store.replace_all(initial.to_dict(orient="records"))
+        self.cache = self.store.to_frame()
         self._persist(df)
         self._save()
         self.last_status = "rest_bootstrap_ok"
@@ -95,6 +114,7 @@ class LiveCandleStream:
             raise RuntimeError("websockets package is not installed")
         topic = candle_topic(self.config.symbol, self.config.interval, self.config.category)
         async with websockets.connect(PUBLIC_WS, ping_interval=None, close_timeout=5) as ws:
+            self.connection_id = uuid.uuid4().hex
             await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
             ping_task = asyncio.create_task(self._ping_loop(ws))
             try:
@@ -102,6 +122,7 @@ class LiveCandleStream:
                     if raw == "pong":
                         continue
                     data = json.loads(raw)
+                    self.last_message_ms = int(time.time() * 1000)
                     # Subscription acknowledgements are useful status, not candles.
                     if data.get("event"):
                         self.last_status = f"ws_{data.get('event')}"
@@ -117,47 +138,71 @@ class LiveCandleStream:
 
     async def stream(self) -> AsyncIterator[dict[str, Any]]:
         backoff = 1.0
-        while True:
-            try:
-                async for msg in self._ws_messages():
-                    df = self._normalize_ws_message(msg)
-                    if df.empty:
-                        continue
-                    self.cache = merge_candle_frames(self.cache, df, max_rows=self.config.max_rows)
-                    self._persist(df)
-                    self._save()
-                    backoff = 1.0
-                    for _, row in df.iterrows():
-                        self.last_emit_ts = int(row["timestamp"])
-                        yield {"type": "candle_update", "transport": "websocket", "candle": self._row_to_chart(row), "rows": int(len(self.cache))}
-            except Exception as exc:
-                self.last_status = f"ws_error: {exc}"
-                # Degraded mode: do not spam Bitget. Fetch recent candles at low frequency.
-                await asyncio.sleep(backoff)
-                backoff = min(30.0, backoff * 1.7)
+        await self.writer.start()
+        try:
+            while True:
                 try:
-                    df = self.public.get_recent_candles(self.config.symbol, self.config.category, self.config.interval, limit=60)
-                    before = set(self.cache["timestamp"].astype("int64")) if not self.cache.empty and "timestamp" in self.cache else set()
-                    self.cache = merge_candle_frames(self.cache, df, max_rows=self.config.max_rows)
-                    self._persist(df)
-                    self._save()
-                    latest = self.cache.tail(3)
-                    yield {"type": "status", "transport": "rest_fallback", "message": str(exc), "rows": int(len(self.cache))}
-                    for _, row in latest.iterrows():
-                        # Send last few rows so an updated current candle is not missed.
-                        yield {"type": "candle_update", "transport": "rest_fallback", "candle": self._row_to_chart(row), "rows": int(len(self.cache)), "is_new": int(row["timestamp"]) not in before}
-                except Exception as rest_exc:
-                    yield {"type": "status", "transport": "offline", "message": f"WS and REST failed: {rest_exc}", "rows": int(len(self.cache))}
+                    async for msg in self._ws_messages():
+                        df = self._normalize_ws_message(msg)
+                        if df.empty:
+                            continue
+                        records = df.to_dict(orient="records")
+                        for record in records:
+                            self.store.apply(record)
+                        self.cache = self.store.to_frame() if self.config.write_csv else self.cache
+                        await self.writer.put_frame(df, source="bitget_live")
+                        if (write_error := self.writer.consume_error()) is not None:
+                            yield self._event({"type": "status", "transport": "db_writer", "message": write_error, "rows": self.store.size})
+                        self._save()
+                        backoff = 1.0
+                        for record in records:
+                            self.last_emit_ts = int(record["timestamp"])
+                            yield self._event({"type": "candle_update", "transport": "websocket", "candle": self._row_to_chart(record), "rows": self.store.size})
+                except Exception as exc:
+                    self.last_status = f"ws_error: {exc}"
+                    self.reconnect_count += 1
+                    delay = min(30.0, backoff)
+                    await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
+                    backoff = min(30.0, backoff * 1.7)
+                    try:
+                        df = self.public.get_recent_candles(self.config.symbol, self.config.category, self.config.interval, limit=60)
+                        before = {c.open_time_ms for c in self.store.values()}
+                        records = df.to_dict(orient="records")
+                        for record in records:
+                            self.store.apply(record)
+                        self.cache = self.store.to_frame() if self.config.write_csv else self.cache
+                        await self.writer.put_frame(df, source="bitget_rest_fallback")
+                        self._save()
+                        latest = records[-3:]
+                        yield self._event({"type": "status", "transport": "rest_fallback", "message": str(exc), "rows": self.store.size, "reconnect_count": self.reconnect_count})
+                        for record in latest:
+                            yield self._event({"type": "candle_update", "transport": "rest_fallback", "candle": self._row_to_chart(record), "rows": self.store.size, "is_new": int(record["timestamp"]) not in before})
+                    except Exception as rest_exc:
+                        yield self._event({"type": "status", "transport": "offline", "message": f"WS and REST failed: {rest_exc}", "rows": self.store.size, "reconnect_count": self.reconnect_count})
+        finally:
+            await self.writer.close()
+
+    def _event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.sequence += 1
+        return {
+            **payload,
+            "connection_id": self.connection_id,
+            "sequence": self.sequence,
+            "server_time_ms": int(time.time() * 1000),
+            "last_ws_message_ms": self.last_message_ms or int(time.time() * 1000),
+            "db_queue_depth": self.writer.queue_depth,
+        }
 
     @staticmethod
-    def _row_to_chart(row: pd.Series) -> dict[str, Any]:
+    def _row_to_chart(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
+        get = row.get
         return {
-            "time": int(int(row["timestamp"]) / 1000),
-            "open": float(row["open"]),
-            "high": float(row["high"]),
-            "low": float(row["low"]),
-            "close": float(row["close"]),
-            "volume": float(row.get("volume", 0) or 0),
+            "time": int(int(get("timestamp")) / 1000),
+            "open": float(get("open")),
+            "high": float(get("high")),
+            "low": float(get("low")),
+            "close": float(get("close")),
+            "volume": float(get("volume", 0) or 0),
         }
 
 
@@ -177,6 +222,7 @@ class LiveSyntheticCandleStream:
         self.public = BitgetPublicClient()
         self.base_cache = pd.DataFrame()
         self.cache = pd.DataFrame()
+        self.writer = CandleWriteBuffer()
         self.last_status = "init"
 
     def _save(self) -> None:
@@ -246,40 +292,41 @@ class LiveSyntheticCandleStream:
 
     async def stream(self) -> AsyncIterator[dict[str, Any]]:
         backoff = 1.0
-        while True:
-            try:
-                async for msg in self._ws_messages():
-                    base = self._normalize_ws_message(msg)
-                    if base.empty:
-                        continue
-                    self.base_cache = merge_candle_frames(self.base_cache, base, max_rows=2000)
-                    derived = self._derived_tail(base)
-                    if derived.empty:
-                        continue
-                    self.cache = merge_candle_frames(self.cache, derived, max_rows=self.config.max_rows)
-                    self._persist(base=base, derived=derived)
-                    self._save()
-                    backoff = 1.0
-                    for _, row in derived.iterrows():
-                        yield {
-                            "type": "candle_update",
-                            "transport": "websocket_1m_aggregate",
-                            "candle": LiveCandleStream._row_to_chart(row),
-                            "rows": int(len(self.cache)),
-                        }
-            except Exception as exc:
-                self.last_status = f"ws_error: {exc}"
-                await asyncio.sleep(backoff)
-                backoff = min(30.0, backoff * 1.7)
+        await self.writer.start()
+        try:
+            while True:
                 try:
-                    base = self.public.get_recent_candles(self.config.symbol, self.config.category, "1m", limit=60)
-                    self.base_cache = merge_candle_frames(self.base_cache, base, max_rows=2000)
-                    derived = self._derived_tail(base)
-                    self.cache = merge_candle_frames(self.cache, derived, max_rows=self.config.max_rows)
-                    self._persist(base=base, derived=derived)
-                    self._save()
-                    yield {"type": "status", "transport": "rest_fallback", "message": str(exc), "rows": int(len(self.cache))}
-                    for _, row in derived.tail(2).iterrows():
-                        yield {"type": "candle_update", "transport": "rest_fallback", "candle": LiveCandleStream._row_to_chart(row), "rows": int(len(self.cache))}
-                except Exception as rest_exc:
-                    yield {"type": "status", "transport": "offline", "message": f"WS and REST failed: {rest_exc}", "rows": int(len(self.cache))}
+                    async for msg in self._ws_messages():
+                        base = self._normalize_ws_message(msg)
+                        if base.empty:
+                            continue
+                        self.base_cache = merge_candle_frames(self.base_cache, base, max_rows=2000)
+                        derived = self._derived_tail(base)
+                        if derived.empty:
+                            continue
+                        self.cache = merge_candle_frames(self.cache, derived, max_rows=self.config.max_rows)
+                        await self.writer.put_frame(base, source="bitget_live")
+                        await self.writer.put_frame(derived, source="derived_1m_live")
+                        self._save()
+                        backoff = 1.0
+                        for row in derived.to_dict(orient="records"):
+                            yield {"type": "candle_update", "transport": "websocket_1m_aggregate", "candle": LiveCandleStream._row_to_chart(row), "rows": int(len(self.cache))}
+                except Exception as exc:
+                    self.last_status = f"ws_error: {exc}"
+                    await asyncio.sleep(min(30.0, backoff) + random.uniform(0, min(30.0, backoff) * 0.2))
+                    backoff = min(30.0, backoff * 1.7)
+                    try:
+                        base = self.public.get_recent_candles(self.config.symbol, self.config.category, "1m", limit=60)
+                        self.base_cache = merge_candle_frames(self.base_cache, base, max_rows=2000)
+                        derived = self._derived_tail(base)
+                        self.cache = merge_candle_frames(self.cache, derived, max_rows=self.config.max_rows)
+                        await self.writer.put_frame(base, source="bitget_rest_fallback")
+                        await self.writer.put_frame(derived, source="derived_rest_fallback")
+                        self._save()
+                        yield {"type": "status", "transport": "rest_fallback", "message": str(exc), "rows": int(len(self.cache))}
+                        for row in derived.tail(2).to_dict(orient="records"):
+                            yield {"type": "candle_update", "transport": "rest_fallback", "candle": LiveCandleStream._row_to_chart(row), "rows": int(len(self.cache))}
+                    except Exception as rest_exc:
+                        yield {"type": "status", "transport": "offline", "message": f"WS and REST failed: {rest_exc}", "rows": int(len(self.cache))}
+        finally:
+            await self.writer.close()

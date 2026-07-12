@@ -46,6 +46,10 @@ Open API docs:
 http://127.0.0.1:8001/docs
 ```
 
+The quant UI defaults to Bitget Futures only. Stock/Toss panels and the surge
+scanner stay disabled unless `ENABLE_STOCK_MARKETS=true` and, separately,
+`ENABLE_SURGE_SCANNER=true` are set in `.env`.
+
 Key endpoints:
 
 - `GET /api/replay/osong_2023_07_15`
@@ -87,6 +91,12 @@ If keys are absent or an external API fails, the report uses explicit error obje
 ```powershell
 cd D:\bitget_quant_system
 pytest tests/test_disaster_system.py -q
+```
+
+SQLite schema maintenance can be run explicitly with:
+
+```powershell
+python -m src.main migrate
 ```
 
 ## Data Policy

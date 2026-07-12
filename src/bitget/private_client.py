@@ -14,9 +14,9 @@ class BitgetPrivateClient:
     API key만 .env에 넣으면 계좌 조회/주문/취소/주문조회/포지션 조회까지 바로 호출 가능.
     실제 주문은 Broker 쪽 safe flag를 통과해야만 전송된다.
     """
-    def __init__(self, base_url='https://api.bitget.com', timeout=10, max_retries=3):
+    def __init__(self, base_url=None, timeout=10, max_retries=3):
         load_dotenv()
-        self.base_url = base_url.rstrip('/')
+        self.base_url = (base_url or os.getenv('BITGET_API_BASE_URL') or 'https://api.bitget.com').rstrip('/')
         self.timeout = timeout
         self.max_retries = max_retries
         self.api_key = os.getenv('BITGET_API_KEY', '')
@@ -87,6 +87,15 @@ class BitgetPrivateClient:
     def get_pending_orders(self, product_type='USDT-FUTURES', symbol=None):
         return self.request('GET', '/api/v2/mix/order/orders-pending', params={
             'productType': product_type, 'symbol': symbol
+        })
+
+    def get_fill_history(self, product_type='USDT-FUTURES', symbol=None, start_time=None, end_time=None, limit=50):
+        return self.request('GET', '/api/v2/mix/order/fill-history', params={
+            'productType': product_type,
+            'symbol': symbol,
+            'startTime': start_time,
+            'endTime': end_time,
+            'limit': min(max(int(limit), 1), 100),
         })
 
     # Trading

@@ -67,3 +67,38 @@ def test_candle_write_buffer_coalesces_repeated_live_updates(monkeypatch, tmp_pa
     assert calls[0][0].iloc[0]["close"] == 109
     assert buffer.flush_count == 1
     assert buffer.write_count == 1
+
+
+def test_account_state_normalizes_provider_rows_and_risk():
+    from src.ui.account_state import build_risk_snapshot, normalize_account, normalize_fills, normalize_positions
+
+    account = normalize_account({"data": [{"accountEquity": "1000", "available": "850", "totalMargin": "150"}]})
+    positions = normalize_positions({"data": [{"symbol": "BTCUSDT", "holdSide": "long", "total": "0.01", "averageOpenPrice": "60000", "markPrice": "61000", "unrealizedPL": "10", "leverage": "3"}]}, symbol="BTCUSDT")
+    fills = normalize_fills({"data": [{"symbol": "BTCUSDT", "tradeSide": "buy", "baseVolume": "0.01", "price": "60000", "tradeTime": "1700000000000", "profit": "4.5"}]}, symbol="BTCUSDT")
+
+    risk = build_risk_snapshot(account, positions, fills)
+    assert account["equity"] == 1000
+    assert positions[0]["notional"] == 610
+    assert fills[0]["pnl"] == 4.5
+    assert risk["position_count"] == 1
+    assert risk["configured_max_leverage"] == 3.0
+
+
+def test_account_snapshot_is_explicit_when_credentials_are_missing(monkeypatch):
+    from fastapi.testclient import TestClient
+    import src.ui.app as uiapp
+
+    class NoCredentialsClient:
+        def has_credentials(self):
+            return False
+
+    monkeypatch.setattr(uiapp, "BitgetPrivateClient", NoCredentialsClient)
+    monkeypatch.setattr(uiapp, "ENABLE_LIVE_TRADING", True)
+    response = TestClient(uiapp.app).get("/api/account/snapshot", params={"mode": "LIVE"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "credentials_missing"
+    assert payload["account"]["equity"] is None
+    assert payload["positions"] == []
+    assert payload["notifications"][0]["code"] == "credentials_missing"

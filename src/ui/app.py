@@ -40,6 +40,7 @@ from src.markets import CRYPTO, KOR_STOCK, US_STOCK, normalize_market_type
 from src.toss.private_client import TossPrivateClient
 from src.toss.public_client import TossApiConfigurationError, TossPublicClient
 from src.scanner.surge_scanner import MAX_BATCH_SIZE, SurgeScanner
+from src.ui.account_state import build_notifications, build_risk_snapshot, normalize_account, normalize_fills, normalize_positions
 
 app = FastAPI(title="Multi-Market Quant Trading System")
 ROOT = Path.cwd()
@@ -65,6 +66,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 ENABLE_STOCK_MARKETS = _env_bool("ENABLE_STOCK_MARKETS", True)
 UI_STOCK_MARKETS = _env_bool("ENABLE_STOCK_MARKETS", False)
 ENABLE_SURGE_SCANNER = _env_bool("ENABLE_SURGE_SCANNER", False)
+ENABLE_DEMO_TRADING = _env_bool("ENABLE_DEMO_TRADING", False)
+ENABLE_LIVE_TRADING = _env_bool("ENABLE_LIVE_TRADING", False)
 
 
 def _position_count(payload: Any) -> int:
@@ -1094,6 +1097,137 @@ def api_backtest(payload: dict[str, Any] = Body(...)):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
+@app.get("/api/account/snapshot")
+async def api_account_snapshot(
+    mode: str = Query("PAPER"),
+    symbol: str = Query("BTCUSDT"),
+    product_type: str = Query("USDT-FUTURES"),
+    market_type: str = Query(CRYPTO),
+    limit: int = Query(50, ge=1, le=100),
+):
+    """Return a normalized, read-only account snapshot for the dashboard.
+
+    Paper mode deliberately reports a not-started state until a paper session
+    exists. Demo/live account reads never place orders and remain unavailable
+    when the corresponding feature flag or credentials are absent.
+    """
+    normalized_mode = str(mode or "PAPER").upper().strip()
+    market_type = normalize_market_type(market_type, product_type)
+    symbol = str(symbol or "BTCUSDT").upper().strip()
+    product_type = _normalize_category(product_type)
+    mode_available = {
+        "PAPER": True,
+        "DEMO": ENABLE_DEMO_TRADING,
+        "LIVE": ENABLE_LIVE_TRADING,
+    }
+    if normalized_mode not in mode_available:
+        return JSONResponse({"ok": False, "error": "mode must be PAPER, DEMO, or LIVE"}, status_code=400)
+    if market_type != CRYPTO:
+        return {
+            "ok": True,
+            "mode": normalized_mode,
+            "market_type": market_type,
+            "status": "market_not_connected",
+            "mode_available": mode_available,
+            "account": {"status": "market_not_connected", "equity": None, "available": None, "used_margin": None, "unrealized_pnl": None},
+            "positions": [],
+            "fills": [],
+            "risk": build_risk_snapshot({"status": "market_not_connected"}, [], []),
+            "notifications": [{"level": "info", "code": "market_account_pending", "message": "이 시장의 계좌 연결은 별도 인증이 필요합니다."}],
+        }
+    if normalized_mode == "PAPER":
+        account = {"status": "paper_not_started", "equity": None, "available": None, "used_margin": None, "unrealized_pnl": None, "margin_coin": "USDT"}
+        return {
+            "ok": True,
+            "mode": normalized_mode,
+            "market_type": market_type,
+            "symbol": symbol,
+            "product_type": product_type,
+            "status": "paper_not_started",
+            "credentials_configured": False,
+            "mode_available": mode_available,
+            "account": account,
+            "positions": [],
+            "fills": [],
+            "risk": build_risk_snapshot(account, [], []),
+            "notifications": [{"level": "info", "code": "paper_not_started", "message": "페이퍼 거래 세션이 아직 시작되지 않았습니다."}],
+            "last_synced_at": now_ms(),
+        }
+    if not mode_available[normalized_mode]:
+        return {
+            "ok": True,
+            "mode": normalized_mode,
+            "market_type": market_type,
+            "symbol": symbol,
+            "product_type": product_type,
+            "status": "mode_disabled",
+            "credentials_configured": False,
+            "mode_available": mode_available,
+            "account": {"status": "mode_disabled", "equity": None, "available": None, "used_margin": None, "unrealized_pnl": None},
+            "positions": [],
+            "fills": [],
+            "risk": build_risk_snapshot({"status": "mode_disabled"}, [], []),
+            "notifications": [{"level": "warning", "code": "mode_disabled", "message": f"{normalized_mode} 모드는 서버 설정에서 비활성화되어 있습니다."}],
+            "last_synced_at": now_ms(),
+        }
+    client = BitgetPrivateClient()
+    if not client.has_credentials():
+        account = {"status": "credentials_missing", "equity": None, "available": None, "used_margin": None, "unrealized_pnl": None}
+        return {
+            "ok": True,
+            "mode": normalized_mode,
+            "market_type": market_type,
+            "symbol": symbol,
+            "product_type": product_type,
+            "status": "credentials_missing",
+            "credentials_configured": False,
+            "mode_available": mode_available,
+            "account": account,
+            "positions": [],
+            "fills": [],
+            "risk": build_risk_snapshot(account, [], []),
+            "notifications": [{"level": "warning", "code": "credentials_missing", "message": "Bitget API 키가 설정되지 않았습니다."}],
+            "last_synced_at": now_ms(),
+        }
+    error: str | None = None
+    account_payload: Any = {}
+    positions_payload: Any = {}
+    fills_payload: Any = {}
+    try:
+        account_payload = await asyncio.to_thread(client.get_account, symbol, product_type, "USDT")
+        positions_payload = await asyncio.to_thread(client.get_positions, product_type, "USDT")
+        try:
+            fills_payload = await asyncio.to_thread(client.get_fill_history, product_type, symbol, None, None, limit)
+        except Exception:
+            # Account and position data remain useful when fill-history access
+            # is restricted by the current account or API permission scope.
+            fills_payload = {}
+    except Exception as exc:
+        error = str(exc)
+    account = normalize_account(account_payload)
+    positions = normalize_positions(positions_payload, symbol=symbol)
+    fills = normalize_fills(fills_payload, symbol=symbol, limit=limit)
+    if error:
+        account["status"] = "error"
+    return {
+        "ok": True,
+        "mode": normalized_mode,
+        "market_type": market_type,
+        "symbol": symbol,
+        "product_type": product_type,
+        "status": "error" if error else account["status"],
+        "error": error,
+        "credentials_configured": True,
+        "mode_available": mode_available,
+        "account": account,
+        "positions": positions,
+        "fills": fills,
+        "risk": build_risk_snapshot(account, positions, fills),
+        "notifications": build_notifications(account=account, positions=positions, fills=fills, error=error),
+        "last_synced_at": now_ms(),
+    }
+
+
 @app.get("/api/market/state")
 def api_market_state():
     return {"ok": True, **MARKET_STATE.snapshot()}
@@ -1345,6 +1479,9 @@ HTML = r"""
 @media(max-width:1450px){.dashboardShell{grid-template-columns:210px minmax(0,1fr) 300px!important}.dashboardShell .left{left:210px}.shellTabs{gap:0}.shellTab{padding:0 7px}.kpiCard strong{font-size:16px}}
 @media(max-width:1180px){.dashboardShell{grid-template-columns:64px minmax(0,1fr) 0!important}.dashboardShell .rail{padding:12px 8px}.dashboardShell .rail .logo{font-size:0;justify-content:center;padding:0}.dashboardShell .sideNavItem{justify-content:center;padding:0}.dashboardShell .sideNavItem .navLabel,.dashboardShell .sideNavLabel,.dashboardShell .accountSummary{display:none}.dashboardShell .right{display:none}.dashboardShell .top{grid-column:2/4}.dashboardShell .left{left:64px}.dashboardShell .drawerToggle{display:grid}}
 </style>
+<style>
+.positionRow{padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid #1d2b38}.positionRow:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}.positionRowHead{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}.positionRowHead b{color:#e4f0f3}.fillList,.notificationList{display:grid;gap:7px;width:100%;padding:10px 12px}.fillRow,.notificationRow{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:10px;color:#8da0ac}.fillRow b{white-space:nowrap}.notificationRow{display:grid;gap:3px;padding-bottom:6px;border-bottom:1px solid #1d2b38}.notificationRow small{color:#647b87}.notificationRow.warning span{color:#f0c56c}.notificationRow.error span{color:#ff7b83}
+</style>
 </head>
 <body>
 <div class="app">
@@ -1590,7 +1727,25 @@ function setMarketDefaults(market){const isCrypto=market==='CRYPTO';if(market===
 function updateDashboardShellSymbol(){const symbol=($('symbol')?.value||'BTCUSDT').trim().toUpperCase();const label=activeMarketType==='CRYPTO'?symbol+' Perpetual':symbol;const node=$('shellInstrumentLabel');if(node)node.textContent=label;const title=$('shellInstrumentMarket');if(title)title.textContent=activeMarketType==='CRYPTO'?'Bitget Futures':activeMarketType.replace('_',' ')}
 function setDashboardShellNav(page){document.querySelectorAll('.sideNavItem,.shellTab').forEach(node=>node.classList.toggle('is-active',node.dataset.page===page));const drawer=$('controlDrawer');if(page==='dashboard'){drawer?.classList.remove('drawer-open');return}drawer?.classList.add('drawer-open');const focusTarget={backtest:'strategy',strategy:'strategy',settings:'symbol',paper:'initialCash',demo:'symbol',live:'symbol'}[page];const target=focusTarget?$(focusTarget):null;if(target){target.focus({preventScroll:true});target.scrollIntoView({block:'nearest'})}if(page==='live'){setStatus('Live mode is locked until API, account, consent, and risk checks are connected.')}else if(page!=='dashboard'){setStatus(page+' workspace is ready for the next connection step.')}}
 function setupDashboardShell(){const app=document.querySelector('.app');if(!app||app.classList.contains('dashboardShell'))return;app.classList.add('dashboardShell');const rail=app.querySelector('.rail');rail.innerHTML='<div class="logo">Bitget Trading</div>';const nav=document.createElement('nav');nav.className='sideNav';nav.innerHTML='<div class="sideNavLabel">Workspace</div>'+[{page:'dashboard',icon:'▦',label:'대시보드'},{page:'backtest',icon:'◈',label:'백테스트'},{page:'paper',icon:'◌',label:'페이퍼 트레이딩'},{page:'demo',icon:'◇',label:'데모 트레이딩'},{page:'live',icon:'●',label:'라이브 트레이딩'},{page:'strategy',icon:'⌁',label:'전략 관리'},{page:'trades',icon:'≡',label:'거래 내역'},{page:'positions',icon:'⌖',label:'포지션'},{page:'notifications',icon:'♧',label:'알림 센터'},{page:'risk',icon:'◒',label:'리스크 관리'},{page:'settings',icon:'⚙',label:'설정'}].map(item=>'<button class="sideNavItem '+(item.page==='dashboard'?'is-active':'')+'" data-page="'+item.page+'" type="button"><span class="navIcon">'+item.icon+'</span><span class="navLabel">'+item.label+'</span></button>').join('');rail.appendChild(nav);const summary=document.createElement('section');summary.className='accountSummary';summary.innerHTML='<div class="accountSummaryHeader"><span>계좌 요약</span><span class="shellConnection"><i></i><span id="shellAccountState">연결 대기</span></span></div><div class="accountMetric"><span>총 자산</span><b id="shellEquity">--</b></div><div class="accountMetric"><span>사용 가능</span><b id="shellAvailable">--</b></div><div class="accountMetric"><span>누적 수익률</span><b id="shellAccountReturn">--</b></div><button class="btn gray" type="button" id="shellAccountDetails">자산 상세보기</button>';rail.appendChild(summary);const top=app.querySelector('.top');top.classList.add('dashboardTop');top.insertAdjacentHTML('afterbegin','<button class="drawerToggle shellIcon" id="drawerToggle" type="button" aria-label="설정 패널 열기">☰</button><button class="shellInstrument" id="shellInstrument" type="button"><span>◉</span><span><b id="shellInstrumentLabel">BTCUSDT Perpetual</b><small id="shellInstrumentMarket">Bitget Futures</small></span><span>⌄</span></button><button class="shellStar" id="shellFavorite" type="button" aria-label="즐겨찾기">☆</button><nav class="shellTabs">'+[{page:'dashboard',label:'대시보드'},{page:'backtest',label:'백테스트'},{page:'paper',label:'페이퍼 트레이딩'},{page:'demo',label:'데모 트레이딩'},{page:'live',label:'라이브 트레이딩'},{page:'settings',label:'설정'}].map(item=>'<button class="shellTab '+(item.page==='dashboard'?'is-active':'')+'" data-page="'+item.page+'" type="button">'+item.label+'</button>').join('')+'</nav><span class="shellModeBadge" id="shellModeBadge">PAPER</span><button class="shellIcon" type="button" aria-label="알림">♧</button><button class="shellIcon" type="button" aria-label="설정">⚙</button>');const chartWrap=app.querySelector('.chartWrap');const chartHead=chartWrap?.querySelector('.chartHead');if(chartWrap&&chartHead&&!chartWrap.querySelector('.kpiStrip')){chartHead.insertAdjacentHTML('beforebegin','<section class="kpiStrip" aria-label="성과 요약"><article class="kpiCard positive"><span>총 수익률</span><strong id="shellKpiReturn">--</strong><small id="shellKpiReturnMeta">거래 기록 연결 대기</small></article><article class="kpiCard"><span>누적 수익</span><strong id="shellKpiProfit">--</strong><small>선택한 거래 모드 기준</small></article><article class="kpiCard negative"><span>최대 낙폭</span><strong id="shellKpiDrawdown">--</strong><small>성과 데이터 연결 대기</small></article><article class="kpiCard"><span>샤프 비율</span><strong id="shellKpiSharpe">--</strong><small>거래 기록 연결 대기</small></article></section>');chartWrap.insertAdjacentHTML('beforeend','<section class="dashboardLower"><article class="lowerPanel"><div class="lowerPanelHeader"><span>전략 성과 요약</span><small id="shellPerformanceRange">데이터 대기</small></div><div class="emptyState" id="shellPerformanceEmpty"><span><strong>성과 데이터 없음</strong>백테스트 또는 거래 기록이 연결되면 표시됩니다.</span></div></article><article class="lowerPanel"><div class="lowerPanelHeader"><span>최근 거래 내역</span><small>실제 체결 기록</small></div><div class="emptyState" id="shellTradesEmpty"><span><strong>거래 내역 없음</strong>연결된 거래 모드의 기록이 여기에 표시됩니다.</span></div></article><article class="lowerPanel"><div class="lowerPanelHeader"><span>알림 센터</span><small id="shellNotificationCount">0</small></div><div class="emptyState" id="shellNotificationsEmpty"><span><strong>새 알림 없음</strong>연결 상태와 주문 이벤트를 표시합니다.</span></div></article></section>')}const left=app.querySelector('.left');if(left)left.id='controlDrawer';const right=app.querySelector('.right');if(right&&!right.querySelector('.shellModePanel'))right.insertAdjacentHTML('afterbegin','<section class="panel shellModePanel"><h3>거래 모드</h3><div class="box"><div class="modeSwitch"><button class="modeButton active" data-mode="PAPER" type="button">PAPER</button><button class="modeButton demo" data-mode="DEMO" type="button" disabled>DEMO</button><button class="modeButton live" data-mode="LIVE" type="button" disabled>LIVE</button></div><div class="modeNotice" id="shellModeNotice">가상 거래 모드. 실제 주문은 실행하지 않습니다.</div></div></section><section class="panel shellPositionPanel"><h3>포지션 현황</h3><div class="box"><div class="positionEmpty" id="shellPositionEmpty">현재 연결된 포지션 데이터가 없습니다.</div></div></section><section class="panel shellRiskPanel"><h3>리스크 관리</h3><div class="box"><div class="metric"><span>일일 손실 사용량</span><b id="shellRiskDaily">--</b></div><div class="riskBar"><i id="shellRiskDailyBar"></i></div><div class="metric"><span>연속 손실</span><b id="shellRiskLosses">--</b></div><div class="metric"><span>최대 레버리지</span><b id="shellRiskLeverage">--</b></div></div></section>');document.querySelectorAll('.sideNavItem,.shellTab').forEach(node=>node.addEventListener('click',()=>setDashboardShellNav(node.dataset.page)));$('shellInstrument')?.addEventListener('click',()=>setDashboardShellNav('settings'));$('drawerToggle')?.addEventListener('click',()=>app.querySelector('.left')?.classList.toggle('drawer-open'));$('shellFavorite')?.addEventListener('click',event=>{event.currentTarget.classList.toggle('is-favorite');event.currentTarget.textContent=event.currentTarget.classList.contains('is-favorite')?'★':'☆'});$('symbol')?.addEventListener('input',updateDashboardShellSymbol);$('category')?.addEventListener('input',updateDashboardShellSymbol);document.querySelectorAll('.modeButton').forEach(button=>button.addEventListener('click',()=>{if(button.disabled)return;document.querySelectorAll('.modeButton').forEach(node=>node.classList.toggle('active',node===button));$('shellModeBadge').textContent=button.dataset.mode}));updateDashboardShellSymbol()}
+let dashboardAccountState=null,dashboardAccountRequestSeq=0,dashboardAccountTimer=null,dashboardTradingMode='PAPER';
+function dashboardValue(value,digits=2,suffix=''){const number=Number(value);return Number.isFinite(number)?number.toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits})+suffix:'--'}
+function dashboardTime(timestamp){if(!timestamp)return '-';try{return new Date(Number(timestamp)).toLocaleString('ko-KR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}catch(error){return '-'}}
+function dashboardStatusLabel(status){return {connected:'연결됨',empty:'응답 데이터 없음',credentials_missing:'API 키 미설정',paper_not_started:'PAPER 대기',mode_disabled:'모드 비활성',error:'동기화 오류',market_not_connected:'시장 연결 대기'}[status]||'연결 대기'}
+function renderDashboardPositions(data){const box=document.querySelector('.shellPositionPanel .box');if(!box)return;const positions=data.positions||[];if(!positions.length){box.innerHTML='<div class="positionEmpty">'+(data.account?.status==='connected'?'현재 보유 포지션이 없습니다.':'계좌 연결 후 포지션을 표시합니다.')+'</div>';return}box.innerHTML=positions.map(position=>'<div class="positionRow"><div class="positionRowHead"><b>'+escapeHtml(position.symbol||'-')+'</b><strong class="'+(position.side==='short'?'red':'green')+'">'+escapeHtml(position.side||'-').toUpperCase()+'</strong></div><div class="metric"><span>수량</span><b>'+dashboardValue(position.qty,6)+'</b></div><div class="metric"><span>평균 진입가</span><b>'+dashboardValue(position.avg_entry_price,2)+'</b></div><div class="metric"><span>평가 손익</span><b class="'+(Number(position.unrealized_pnl)>=0?'green':'red')+'">'+dashboardValue(position.unrealized_pnl,2,' USDT')+'</b></div></div>').join('')}
+function renderDashboardFills(data){const fills=data.fills||[];const rows=$('tradeRows');if(rows)rows.innerHTML=fills.slice(0,12).map(fill=>'<tr><td>'+dashboardTime(fill.timestamp)+'</td><td class="'+(fill.side==='sell'?'red':'green')+'">'+escapeHtml(fill.side||'-')+'</td><td>'+dashboardValue(fill.price,2)+'</td><td class="'+(Number(fill.pnl)>=0?'green':'red')+'">'+dashboardValue(fill.pnl,2)+'</td></tr>').join('');const empty=$('shellTradesEmpty');if(!empty)return;if(!fills.length){empty.innerHTML='<span><strong>거래 내역 없음</strong>'+(data.account?.status==='connected'?'최근 체결 기록이 없습니다.':'계좌 연결 후 최근 체결을 표시합니다.')+'</span>';return}empty.innerHTML='<div class="fillList">'+fills.slice(0,4).map(fill=>'<div class="fillRow"><span>'+dashboardTime(fill.timestamp)+' '+escapeHtml(fill.symbol||'-')+'</span><b class="'+(fill.side==='sell'?'red':'green')+'">'+escapeHtml(fill.side||'-')+' '+dashboardValue(fill.pnl,2)+'</b></div>').join('')+'</div>'}
+function renderDashboardNotifications(data){const notifications=data.notifications||[];const count=$('shellNotificationCount');if(count)count.textContent=String(notifications.length);const empty=$('shellNotificationsEmpty');if(!empty)return;if(!notifications.length){empty.innerHTML='<span><strong>새 알림 없음</strong>현재 확인된 계좌 이벤트가 없습니다.</span>';return}empty.innerHTML='<div class="notificationList">'+notifications.slice(0,4).map(item=>'<div class="notificationRow '+escapeHtml(item.level||'info')+'"><span>'+escapeHtml(item.message||'-')+'</span><small>'+dashboardTime(item.timestamp)+'</small></div>').join('')+'</div>'}
+function renderDashboardRisk(data){const risk=data.risk||{};const daily=Number(risk.daily_pnl);const limit=Number(risk.daily_loss_limit);const usage=Number(risk.daily_loss_usage_pct);if($('shellRiskDaily'))$('shellRiskDaily').textContent=Number.isFinite(daily)?dashboardValue(daily,2,' USDT'):'--';if($('shellRiskLosses'))$('shellRiskLosses').textContent=Number.isFinite(Number(risk.consecutive_losses))?String(risk.consecutive_losses)+' / '+String(risk.max_consecutive_losses??'--'):'--';if($('shellRiskLeverage'))$('shellRiskLeverage').textContent=Number.isFinite(Number(risk.max_leverage))?dashboardValue(risk.max_leverage,1)+'x / '+dashboardValue(risk.configured_max_leverage,1)+'x':'--';const bar=$('shellRiskDailyBar');if(bar)bar.style.width=(Number.isFinite(usage)?Math.min(100,Math.max(0,usage)):0)+'%';const riskPanel=$('risk');if(riskPanel)riskPanel.innerHTML='<div class="metric"><span>일일 손익</span><b class="'+(daily>=0?'green':'red')+'">'+(Number.isFinite(daily)?dashboardValue(daily,2,' USDT'):'--')+'</b></div><div class="metric"><span>손실 한도</span><b>'+(Number.isFinite(limit)?dashboardValue(limit,2,' USDT'):'--')+'</b></div><div class="metric"><span>총 노출</span><b>'+dashboardValue(risk.gross_exposure,2,' USDT')+'</b></div>'}
+function updateDashboardModeAvailability(data){const availability=data.mode_available||{};const demo=document.querySelector('.modeButton[data-mode="DEMO"]');const live=document.querySelector('.modeButton[data-mode="LIVE"]');if(demo)demo.disabled=!availability.DEMO;if(live)live.disabled=!(availability.LIVE&&data.credentials_configured&&data.status==='connected');const notice=$('shellModeNotice');if(notice){if(data.status==='credentials_missing')notice.textContent='Bitget API 키가 없어 계좌 조회가 대기 중입니다.';else if(data.status==='mode_disabled')notice.textContent=data.notifications?.[0]?.message||'이 모드는 서버 설정에서 비활성화되어 있습니다.';else if(data.mode==='PAPER')notice.textContent='가상 거래 세션이 시작되면 잔고와 체결을 표시합니다.';else notice.textContent='읽기 전용 계좌 상태 동기화 완료';}}
+function renderDashboardAccount(data){dashboardAccountState=data;const account=data.account||{};const status=dashboardStatusLabel(data.status||account.status);if($('shellAccountState'))$('shellAccountState').textContent=status;if($('shellEquity'))$('shellEquity').textContent=dashboardValue(account.equity,2);if($('shellAvailable'))$('shellAvailable').textContent=dashboardValue(account.available,2);if($('shellAccountReturn'))$('shellAccountReturn').textContent='--';const pnl=Number(data.risk?.daily_pnl);const equity=Number(account.equity);const dailyReturn=Number.isFinite(pnl)&&Number.isFinite(equity)&&equity!==0?pnl/equity*100:null;if($('shellKpiReturn'))$('shellKpiReturn').textContent=Number.isFinite(dailyReturn)?dashboardValue(dailyReturn,2,'%'):'--';if($('shellKpiProfit'))$('shellKpiProfit').textContent=Number.isFinite(pnl)?dashboardValue(pnl,2,' USDT'):'--';if($('shellKpiReturnMeta'))$('shellKpiReturnMeta').textContent=data.mode+' 기준 당일 손익';if($('shellKpiDrawdown'))$('shellKpiDrawdown').textContent='--';if($('shellKpiSharpe'))$('shellKpiSharpe').textContent='--';const kpiTitle=document.querySelector('.kpiCard span');if(kpiTitle)kpiTitle.textContent='당일 수익률';renderDashboardPositions(data);renderDashboardFills(data);renderDashboardNotifications(data);renderDashboardRisk(data);updateDashboardModeAvailability(data);if($('status')&&data.error)$('status').textContent='Account sync error\\n'+data.error}
+async function refreshDashboardAccountState(){const request=++dashboardAccountRequestSeq;const symbol=($('symbol')?.value||'BTCUSDT').trim().toUpperCase();const category=normalizeCategory($('category')?.value||'USDT-FUTURES');try{const query=new URLSearchParams({mode:dashboardTradingMode,symbol,product_type:category,market_type:activeMarketType,limit:'50'});const response=await fetch('/api/account/snapshot?'+query);const data=await response.json();if(request!==dashboardAccountRequestSeq)return;if(!data.ok)throw Error(data.error||'account snapshot failed');renderDashboardAccount(data)}catch(error){if(request!==dashboardAccountRequestSeq)return;renderDashboardAccount({ok:false,mode:dashboardTradingMode,status:'error',account:{status:'error'},positions:[],fills:[],risk:{},notifications:[{level:'error',message:'계좌 상태를 읽지 못했습니다.'}],error:error.message,mode_available:{PAPER:true,DEMO:false,LIVE:false}})}finally{clearTimeout(dashboardAccountTimer);dashboardAccountTimer=setTimeout(refreshDashboardAccountState,15000)}}
+function selectDashboardTradingMode(mode){const button=document.querySelector('.modeButton[data-mode="'+mode+'"]');if(!button||button.disabled)return;dashboardTradingMode=mode;document.querySelectorAll('.modeButton').forEach(node=>node.classList.toggle('active',node.dataset.mode===mode));const badge=$('shellModeBadge');if(badge){badge.textContent=mode;badge.classList.toggle('demo',mode==='DEMO');badge.classList.toggle('live',mode==='LIVE')}refreshDashboardAccountState()}
+function dashboardValue(value,digits=2,suffix=''){if(value===null||value===undefined||value==='')return '--';const number=Number(value);return Number.isFinite(number)?number.toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits})+suffix:'--'}
+function renderDashboardRisk(data){const risk=data.risk||{};const connected=data.account?.status==='connected';const daily=connected?Number(risk.daily_pnl):NaN;const limit=connected?Number(risk.daily_loss_limit):NaN;const usage=connected?Number(risk.daily_loss_usage_pct):NaN;if($('shellRiskDaily'))$('shellRiskDaily').textContent=Number.isFinite(daily)?dashboardValue(daily,2,' USDT'):'--';if($('shellRiskLosses'))$('shellRiskLosses').textContent=connected&&Number.isFinite(Number(risk.consecutive_losses))?String(risk.consecutive_losses)+' / '+String(risk.max_consecutive_losses??'--'):'--';if($('shellRiskLeverage'))$('shellRiskLeverage').textContent=connected&&Number.isFinite(Number(risk.max_leverage))?dashboardValue(risk.max_leverage,1)+'x / '+dashboardValue(risk.configured_max_leverage,1)+'x':'--';const bar=$('shellRiskDailyBar');if(bar)bar.style.width=(Number.isFinite(usage)?Math.min(100,Math.max(0,usage)):0)+'%';const riskPanel=$('risk');if(riskPanel)riskPanel.innerHTML='<div class="metric"><span>일일 손익</span><b class="'+(daily>=0?'green':'red')+'">'+(Number.isFinite(daily)?dashboardValue(daily,2,' USDT'):'--')+'</b></div><div class="metric"><span>손실 한도</span><b>'+(Number.isFinite(limit)?dashboardValue(limit,2,' USDT'):'--')+'</b></div><div class="metric"><span>총 노출</span><b>'+dashboardValue(connected?risk.gross_exposure:null,2,' USDT')+'</b></div>'}
+function renderDashboardAccount(data){dashboardAccountState=data;const account=data.account||{};const status=dashboardStatusLabel(data.status||account.status);const connected=account.status==='connected';if($('shellAccountState'))$('shellAccountState').textContent=status;if($('shellEquity'))$('shellEquity').textContent=dashboardValue(connected?account.equity:null,2);if($('shellAvailable'))$('shellAvailable').textContent=dashboardValue(connected?account.available:null,2);if($('shellAccountReturn'))$('shellAccountReturn').textContent='--';const pnl=connected?Number(data.risk?.daily_pnl):NaN;const equity=connected?Number(account.equity):NaN;const dailyReturn=Number.isFinite(pnl)&&Number.isFinite(equity)&&equity!==0?pnl/equity*100:null;if($('shellKpiReturn'))$('shellKpiReturn').textContent=dashboardValue(dailyReturn,2,'%');if($('shellKpiProfit'))$('shellKpiProfit').textContent=dashboardValue(connected?pnl:null,2,' USDT');if($('shellKpiReturnMeta'))$('shellKpiReturnMeta').textContent=data.mode+' 기준 당일 손익';if($('shellKpiDrawdown'))$('shellKpiDrawdown').textContent='--';if($('shellKpiSharpe'))$('shellKpiSharpe').textContent='--';const kpiTitle=document.querySelector('.kpiCard span');if(kpiTitle)kpiTitle.textContent='당일 수익률';renderDashboardPositions(data);renderDashboardFills(data);renderDashboardNotifications(data);renderDashboardRisk(data);updateDashboardModeAvailability(data);if($('status')&&data.error)$('status').textContent='Account sync error\\n'+data.error}
 setupDashboardShell();
+document.querySelectorAll('.modeButton').forEach(button=>button.onclick=()=>selectDashboardTradingMode(button.dataset.mode));
+refreshDashboardAccountState();
+ applyFeatureFlags();updateStockPanels();
  applyFeatureFlags();updateStockPanels();
 $('stockSearch').oninput=()=>{clearTimeout(stockSearchTimer);stockSearchTimer=setTimeout(()=>searchStockSymbols(),180)};
 $('stockSearchBtn').onclick=()=>searchStockSymbols();

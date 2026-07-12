@@ -1,7 +1,7 @@
 import argparse, json
 from src.data_engine.historical_loader import download_to_csv
 from src.data_engine.demo_data import make_demo_candles
-from src.data_engine.storage import save_csv, load_csv
+from src.data_engine.storage import init_db, save_csv, load_csv
 from src.data_engine.validator import validate_candles
 from src.strategies.factory import make_strategy
 from src.backtest.engine import BacktestEngine
@@ -91,10 +91,14 @@ def main():
     live=sub.add_parser('live')
     live.add_argument('--symbol',default='BTCUSDT'); live.add_argument('--product-type',default='USDT-FUTURES'); live.add_argument('--market-type',default='CRYPTO',choices=['CRYPTO','KOR_STOCK','US_STOCK']); live.add_argument('--interval',default='1m'); live.add_argument('--poll-sec',type=int,default=10); add_strategy_args(live); live.add_argument('--once',action='store_true'); live.add_argument('--i-understand-live',action='store_true')
 
+    sub.add_parser('migrate', help='initialize or migrate the SQLite schema once')
     sub.add_parser('ui')
     a=p.parse_args()
 
-    if a.cmd=='download':
+    if a.cmd=='migrate':
+        init_db()
+        print('SQLite schema is ready.')
+    elif a.cmd=='download':
         df=download_to_csv(a.symbol,a.category,a.interval,a.start,a.end,a.out, limit=a.limit); print(f'saved {len(df)} rows -> {a.out}')
     elif a.cmd=='backfill-year':
         from src.data_engine.backfill import backfill_year_minute_data

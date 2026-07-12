@@ -1,0 +1,61 @@
+{
+  "asset_set_id": "osong_2023_assets",
+  "policy": "좌표가 공식 GIS, 공공데이터, 또는 사용자가 명시한 검증 좌표에서 확인되지 않으면 지도에 표시하지 않는다.",
+  "assets": [
+    {
+      "asset_id": "mihogang",
+      "name": "미호강",
+      "asset_type": "river",
+      "coordinates": null,
+      "coordinate_status": "source_missing",
+      "display_policy": "list_only_until_verified_coordinate_available",
+      "source_name": "국무조정실 오송 궁평2지하차도 침수사고 감찰조사 결과",
+      "source_url": "https://www.opm.go.kr/opm/news/press1.do?articleNo=154431&attachNo=136402&mode=download",
+      "source_type": "official_report"
+    },
+    {
+      "asset_id": "mihocheongyo",
+      "name": "미호천교",
+      "asset_type": "water_level_station_or_bridge_reference",
+      "coordinates": null,
+      "coordinate_status": "source_missing",
+      "display_policy": "list_only_until_verified_coordinate_available",
+      "source_name": "국무조정실 오송 궁평2지하차도 침수사고 감찰조사 결과",
+      "source_url": "https://www.opm.go.kr/opm/news/press1.do?articleNo=154431&attachNo=136402&mode=download",
+      "source_type": "official_report"
+    },
+    {
+      "asset_id": "gungpyeong2_underpass",
+      "name": "궁평2지하차도",
+      "asset_type": "underpass",
+      "coordinates": null,
+      "coordinate_status": "source_missing",
+      "display_policy": "list_only_until_verified_coordinate_available",
+      "source_name": "국무조정실 오송 궁평2지하차도 침수사고 감찰조사 결과",
+      "source_url": "https://www.opm.go.kr/opm/news/press1.do?articleNo=154431&attachNo=136402&mode=download",
+      "source_type": "official_report"
+    },
+    {
+      "asset_id": "temporary_levee_near_mihocheongyo",
+      "name": "미호천교 부근 임시제방",
+      "asset_type": "levee_related_point",
+      "coordinates": null,
+      "coordinate_status": "source_missing",
+      "display_policy": "list_only_until_verified_coordinate_available",
+      "source_name": "국무조정실 오송 궁평2지하차도 침수사고 감찰조사 결과",
+      "source_url": "https://www.opm.go.kr/opm/news/press1.do?articleNo=154431&attachNo=136402&mode=download",
+      "source_type": "official_report"
+    },
+    {
+      "asset_id": "nearby_roads",
+      "name": "주변 도로",
+      "asset_type": "road",
+      "coordinates": null,
+      "coordinate_status": "source_missing",
+      "display_policy": "list_only_until_verified_coordinate_available",
+      "source_name": "국무조정실 오송 궁평2지하차도 침수사고 감찰조사 결과",
+      "source_url": "https://www.opm.go.kr/opm/news/press1.do?articleNo=154431&attachNo=136402&mode=download",
+      "source_type": "official_report"
+    }
+  ]
+}

@@ -18,7 +18,7 @@ The first MVP focuses on the 2023-07-15 Osong Gungpyeong 2 underpass flood accid
 ## Required Accounts And Keys
 
 - HRFCO OpenAPI key: apply through the Han River Flood Control Office OpenAPI page.
-- K-water public data key: apply through data.go.kr for `?쒓뎅?섏옄?먭났???섎Ц ?댁쁺 ?뺣낫` and `?쒓뎅?섏옄?먭났???먯퐫??議고쉶`.
+- K-water public data key: apply through data.go.kr for `한국수자원공사_수문 운영 정보` and `한국수자원공사_댐코드 조회`.
 - OpenAI API key: optional. Without it, the backend uses a deterministic guarded fallback decision.
 - GitHub account/repository: needed only when you want to publish this workspace.
 

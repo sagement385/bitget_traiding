@@ -1,0 +1,1496 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from fastapi import FastAPI, Body, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from src.backtest.engine import BacktestEngine
+from src.bitget.public_client import BitgetPublicClient
+from src.bitget.private_client import BitgetPrivateClient
+from src.data_engine.canonical import CANONICAL_INTERVALS, bucket_start_ms, find_market_gaps, load_or_fetch_canonical_candles, market_to_ms
+from src.data_engine.demo_data import make_demo_candles
+from src.data_engine.historical_loader import download_to_csv, load_or_fetch_candles
+from src.data_engine.storage import (
+    ensure_stock_symbol,
+    load_csv,
+    load_candles,
+    save_csv,
+    search_stock_symbols,
+    stock_universe_status,
+    upsert_candles,
+    upsert_stock_symbols,
+)
+from src.data_engine.candle_stream import LiveCandleStream, LiveSyntheticCandleStream, StreamConfig
+from src.data_engine.tick_engine import LiveTickCandleStream, TickStreamConfig, SECOND_INTERVALS
+from src.data_engine.validator import find_gaps
+from src.utils.time import INTERVAL_MS, now_ms, to_ms
+from src.strategies.factory import make_strategy
+from src.indicators.library import add_common_indicators, surge_snapshot
+from src.execution.market_state_manager import MarketStateManager
+from src.markets import CRYPTO, KOR_STOCK, US_STOCK, normalize_market_type
+from src.toss.private_client import TossPrivateClient
+from src.toss.public_client import TossApiConfigurationError, TossPublicClient
+from src.scanner.surge_scanner import MAX_BATCH_SIZE, SurgeScanner
+
+app = FastAPI(title="Multi-Market Quant Trading System")
+ROOT = Path.cwd()
+RAW = ROOT / "data" / "raw"
+OUT = ROOT / "results" / "backtests"
+UI_STATIC = Path(__file__).resolve().parent / "static"
+RAW.mkdir(parents=True, exist_ok=True)
+OUT.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(UI_STATIC)), name="static")
+MARKET_STATE = MarketStateManager(risk_poll_seconds=20)
+CSV_COMPAT_EXPORT = os.getenv("CSV_COMPAT_EXPORT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _position_count(payload: Any) -> int:
+    """Count non-zero position records across provider-specific response shapes."""
+    if isinstance(payload, dict):
+        payload = payload.get("result", payload.get("data", payload.get("positions", payload.get("items", []))))
+    if isinstance(payload, dict):
+        payload = payload.get("items", payload.get("positions", []))
+    if not isinstance(payload, list):
+        return 0
+    count = 0
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("qty", row.get("quantity", row.get("size", row.get("positionQty", 0))))
+        try:
+            count += int(float(raw) != 0)
+        except (TypeError, ValueError):
+            continue
+    return count
+
+
+async def _toss_position_count(market_type: str) -> int | None:
+    client = TossPrivateClient()
+    if not client.has_credentials():
+        return None
+    try:
+        return _position_count(await asyncio.to_thread(client.get_positions, market_type))
+    except (TossApiConfigurationError, RuntimeError):
+        # A stock chart must not keep a position poller alive until an account
+        # has been selected and Toss can return its holdings.
+        return None
+
+
+async def _crypto_position_count() -> int | None:
+    client = BitgetPrivateClient()
+    if not client.has_credentials():
+        return None
+    return _position_count(await asyncio.to_thread(client.get_positions))
+
+
+async def _toss_risk_poll(market_type: str) -> None:
+    # Position polling is deliberately separate from heavy chart/quote streams.
+    # Strategy-specific stop/target actions can be bound to this hook only after
+    # a verified Toss order contract and explicit live-trading approval exist.
+    await _toss_position_count(market_type)
+
+
+MARKET_STATE.configure_market(KOR_STOCK, position_probe=lambda: _toss_position_count(KOR_STOCK), risk_check=lambda: _toss_risk_poll(KOR_STOCK))
+MARKET_STATE.configure_market(US_STOCK, position_probe=lambda: _toss_position_count(US_STOCK), risk_check=lambda: _toss_risk_poll(US_STOCK))
+MARKET_STATE.configure_market(CRYPTO, position_probe=_crypto_position_count)
+
+
+def _today_utc_iso() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _normalize_category(value: Any) -> str:
+    text = str(value or "USDT-FUTURES").upper().strip()
+    aliases = {"USDT-FUTURE": "USDT-FUTURES", "USDC-FUTURE": "USDC-FUTURES", "COIN-FUTURE": "COIN-FUTURES"}
+    return aliases.get(text, text)
+
+
+def _is_stock_market(market_type: str) -> bool:
+    return market_type in {KOR_STOCK, US_STOCK}
+
+
+def _stock_candle_category(market_type: str, exchange: str | None = None) -> str:
+    """Keep candle-cache keys stable when Toss returns KOSPI/KOSDAQ metadata."""
+    return "KRX" if market_type == KOR_STOCK else str(exchange or "NASDAQ").upper().strip()
+
+
+def _is_direct_stock_symbol(value: str, market_type: str) -> bool:
+    text = str(value or "").upper().strip()
+    if market_type == KOR_STOCK:
+        return bool(re.fullmatch(r"\d{6}", text))
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", text))
+
+
+def _coerce_end_date(value: Any) -> str | None:
+    # Empty end means: use current server time, not a stale fixed date.
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _df_from_chart_candles(candles: list[dict[str, Any]], symbol: str = "BTCUSDT", category: str = "USDT-FUTURES", interval: str = "1m", market_type: str = CRYPTO) -> pd.DataFrame:
+    rows = []
+    for c in candles or []:
+        try:
+            t = int(float(c.get("time")))
+            # Lightweight Charts uses seconds; some callers may already pass ms.
+            ts = t if t > 10_000_000_000 else t * 1000
+            rows.append({
+                "timestamp": ts,
+                "open": float(c.get("open")),
+                "high": float(c.get("high")),
+                "low": float(c.get("low")),
+                "close": float(c.get("close")),
+                "volume": float(c.get("volume", 0) or 0),
+                "turnover": float(c.get("turnover", 0) or 0),
+                "symbol": symbol.upper(),
+                "category": category,
+                "interval": interval,
+                "market_type": normalize_market_type(market_type, category),
+            })
+        except Exception:
+            continue
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
+
+INTERVAL_TO_SECONDS = {
+    "1s": 1,
+    "3s": 3,
+    "5s": 5,
+    "15s": 15,
+    "30s": 30,
+    "1m": 60,
+    "2m": 120,
+    "3m": 180,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1H": 3600,
+    "2H": 7200,
+    "4H": 14400,
+    "6H": 21600,
+    "12H": 43200,
+    "1D": 86400,
+    "1W": 604800,
+    "1M": 2592000,
+}
+
+
+def _csv_path(symbol: str, interval: str, market_type: str = CRYPTO) -> Path:
+    return RAW / f"{normalize_market_type(market_type)}_{symbol.upper()}_{interval}.csv"
+
+
+def _maybe_save_csv(df: pd.DataFrame, path: Path) -> None:
+    """Keep CSV export opt-in; SQLite is the normal runtime cache."""
+    if CSV_COMPAT_EXPORT:
+        save_csv(df, str(path))
+
+
+def _cached_window(
+    symbol: str,
+    interval: str,
+    category: str = "USDT-FUTURES",
+    start: str | int | None = None,
+    end: str | int | None = None,
+    limit: int = 1000,
+    market_type: str = CRYPTO,
+) -> tuple[pd.DataFrame, int, int]:
+    step = INTERVAL_MS.get(interval)
+    if not step:
+        return pd.DataFrame(), 0, 0
+    end_ms = min(market_to_ms(end, market_type, end_of_day=True), now_ms()) if end is not None else now_ms()
+    requested_start = market_to_ms(start, market_type) if start is not None else end_ms - step * int(limit)
+    start_ms = max(0, max(int(requested_start), int(end_ms - step * int(limit))))
+    if interval in CANONICAL_INTERVALS:
+        start_ms = bucket_start_ms(start_ms, interval, market_type)
+    try:
+        db = load_candles(symbol.upper(), category, interval, start_ms, end_ms, limit=None, market_type=market_type)
+    except Exception:
+        return pd.DataFrame(), start_ms, end_ms
+    if db.empty:
+        return db, start_ms, end_ms
+    db = db.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    return db.tail(int(limit)).reset_index(drop=True), start_ms, end_ms
+
+
+def _load_cached_range(
+    symbol: str,
+    interval: str,
+    category: str = "USDT-FUTURES",
+    start: str | int | None = None,
+    end: str | int | None = None,
+    limit: int = 1000,
+    market_type: str = CRYPTO,
+) -> pd.DataFrame:
+    db, start_ms, end_ms = _cached_window(symbol, interval, category, start, end, limit, market_type)
+    step = INTERVAL_MS.get(interval)
+    if not step or db.empty:
+        return pd.DataFrame()
+    gaps = [g for g in find_market_gaps(db, interval, market_type) if g[2] > 0]
+    if gaps:
+        return pd.DataFrame()
+    if market_type != CRYPTO:
+        # Stock sessions have expected overnight, weekend, and holiday gaps.
+        # The canonical loader performs session-aware repair before this
+        # fallback is used, so cached stock rows remain usable when the provider
+        # is temporarily unavailable.
+        return db.tail(int(limit)).reset_index(drop=True)
+    first = int(db["timestamp"].iloc[0])
+    last = int(db["timestamp"].iloc[-1])
+    if first > start_ms + step:
+        return pd.DataFrame()
+    # Allow the currently-forming candle to be absent, but do not serve an
+    # obviously stale tail when the caller asked for data up to now.
+    if end is None and last < end_ms - step * 2:
+        return pd.DataFrame()
+    return db.tail(int(limit)).reset_index(drop=True)
+
+
+def _refresh_cached_canonical_window(
+    symbol: str,
+    category: str,
+    interval: str,
+    start: str | int | None,
+    end: str | int | None,
+    limit: int,
+    market_type: str = CRYPTO,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Repair only the missing or stale part of a cached chart window.
+
+    A stale cache tail used to fall through to a full canonical aggregation.
+    That could read hundreds of thousands of 1m rows for a 1H/1D chart even
+    when only the latest exchange bucket was missing.
+    """
+    market_type = normalize_market_type(market_type, category)
+    cached, start_ms, end_ms = _cached_window(symbol, interval, category, start, end, limit, market_type)
+    if market_type != CRYPTO:
+        # Stock cache repair is always delegated to the canonical 1m pipeline.
+        # It requests only regular-session holes, persists successful patches,
+        # and never treats nights/weekends as chart gaps.
+        _, report = load_or_fetch_canonical_candles(
+            symbol.upper(), category, interval, start_ms, end_ms,
+            limit=None, fetch=True, persist_derived=True,
+            refresh_recent_tail=end is None, market_type=market_type,
+        )
+        cached, _, _ = _cached_window(symbol, interval, category, start, end, limit, market_type)
+        return cached, {
+            "source": "stock_cache_repaired",
+            "rows": int(len(cached)),
+            "fetched_1m": int(report.fetched_1m),
+            "gaps_found": int(report.gaps_found),
+        }
+    step = INTERVAL_MS[interval]
+    refresh_start: int | None = None
+    force_refresh_start: int | None = None
+    if cached.empty:
+        refresh_start = start_ms
+    else:
+        gaps = [g for g in find_market_gaps(cached, interval, market_type) if g[2] > 0]
+        first = int(cached["timestamp"].iloc[0])
+        last = int(cached["timestamp"].iloc[-1])
+        if first > start_ms + step:
+            refresh_start = start_ms
+        elif gaps:
+            refresh_start = max(start_ms, bucket_start_ms(int(gaps[0][0]), interval, market_type))
+        elif end is None and last < end_ms - step * 2:
+            refresh_start = max(start_ms, bucket_start_ms(last, interval, market_type))
+        elif end is None:
+            # A candle with the current bucket timestamp may still contain an
+            # old in-progress value. Refresh only the active bucket's recent
+            # 1m source data, never the complete chart history.
+            refresh_start = max(start_ms, bucket_start_ms(last, interval, market_type))
+            force_refresh_start = max(refresh_start, end_ms - 5 * 60 * 1000)
+
+    if refresh_start is not None:
+        _, report = load_or_fetch_canonical_candles(
+            symbol.upper(), category, interval, refresh_start, end_ms,
+            limit=None, fetch=True, persist_derived=True,
+            force_refresh_start_ms=force_refresh_start,
+            refresh_recent_tail=False,
+            market_type=market_type,
+        )
+        cached, _, _ = _cached_window(symbol, interval, category, start, end, limit, market_type)
+        return cached, {
+            "source": "db_cache_current_bucket_refreshed" if force_refresh_start is not None else "db_cache_tail_repaired",
+            "rows": int(len(cached)),
+            "refresh_start": int(refresh_start),
+            "fetched_1m": int(report.fetched_1m),
+            "gaps_found": int(report.gaps_found),
+        }
+    return cached, {"source": "db_cache", "rows": int(len(cached))}
+
+
+def _chart_time_ms(value: Any) -> int | None:
+    """Accept the chart's seconds timestamp without trusting its unit."""
+    try:
+        stamp = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp > 10_000_000_000 else stamp * 1000
+
+
+def _repair_live_gap(
+    symbol: str,
+    category: str,
+    interval: str,
+    client_last_time: Any,
+    market_type: str = CRYPTO,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Fill only the interval from the displayed chart tail to now.
+
+    The full historical cache has already been validated. When a live session
+    starts later, this function deliberately looks only at the client cursor
+    through the current time and asks Bitget for missing 1m rows in that span.
+    """
+    if interval.endswith("s") or interval not in CANONICAL_INTERVALS:
+        return pd.DataFrame(), {"source": "live_no_history", "rows": 0}
+    cursor_ms = _chart_time_ms(client_last_time)
+    if cursor_ms is None:
+        return pd.DataFrame(), {"source": "live_no_cursor", "rows": 0}
+    end_ms = now_ms()
+    if cursor_ms > end_ms:
+        return pd.DataFrame(), {"source": "live_future_cursor", "rows": 0}
+    market_type = normalize_market_type(market_type, category)
+    start_ms = bucket_start_ms(cursor_ms, interval, market_type)
+    force_refresh_start = max(start_ms, end_ms - 5 * 60 * 1000)
+    df, report = load_or_fetch_canonical_candles(
+        symbol.upper(), category, interval, start_ms, end_ms,
+        limit=None, fetch=True, persist_derived=True,
+        force_refresh_start_ms=force_refresh_start,
+        refresh_recent_tail=False,
+        market_type=market_type,
+    )
+    return df, {
+        "source": "live_gap_repair",
+        "rows": int(len(df)),
+        "from": int(start_ms),
+        "to": int(end_ms),
+        "fetched_1m": int(report.fetched_1m),
+        "gaps_found": int(report.gaps_found),
+    }
+
+
+def _load_local(symbol: str, interval: str, category: str = "USDT-FUTURES", limit: int = 1000, market_type: str = CRYPTO) -> pd.DataFrame:
+    # Prefer the interval-specific SQLite cache so opening the UI does not
+    # re-aggregate a large 1m history range on every request.
+    db = _load_cached_range(symbol, interval, category, limit=limit, market_type=market_type)
+    if not db.empty:
+        return db
+    # If the interval cache is missing, derive a bounded contiguous slice from
+    # the canonical 1m cache. CSV fallback is kept for compatibility with older runs.
+    if interval in CANONICAL_INTERVALS:
+        try:
+            end_ms = now_ms()
+            start_ms = max(0, end_ms - INTERVAL_MS[interval] * int(limit))
+            can, report = load_or_fetch_canonical_candles(
+                symbol.upper(),
+                category,
+                interval,
+                start_ms,
+                end_ms,
+                limit=limit,
+                fetch=False,
+                persist_derived=False,
+                market_type=market_type,
+            )
+            if not can.empty and int(report.gaps_found) == 0:
+                return can.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        except Exception:
+            pass
+    p = _csv_path(symbol, interval, market_type)
+    if not p.exists() or p.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(p)
+        if "timestamp" in df:
+            df = df.drop_duplicates("timestamp").sort_values("timestamp").tail(limit).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _ensure_data(symbol: str = "BTCUSDT", category: str = "USDT-FUTURES", interval: str = "1H", limit: int = 1000, market_type: str = CRYPTO) -> pd.DataFrame:
+    df = _load_local(symbol, interval, category, limit=limit, market_type=market_type)
+    if df.empty:
+        # Demo fallback only for first-run UI. It is never used when source=bitget.
+        df = make_demo_candles(symbol, category, interval)
+        df["market_type"] = normalize_market_type(market_type, category)
+        _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
+        try:
+            upsert_candles(df, market_type=market_type)
+        except Exception:
+            pass
+    return df.tail(limit).reset_index(drop=True)
+
+
+def _num(v: Any, default=0.0) -> float:
+    try:
+        if pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _candles_json(df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df.empty:
+        return []
+    use = df.copy()
+    for c in ["timestamp", "open", "high", "low", "close", "volume"]:
+        if c in use:
+            use[c] = pd.to_numeric(use[c], errors="coerce")
+    use = use.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    if use.empty:
+        return []
+    use["time"] = (use["timestamp"].astype("int64") // 1000).astype("int64")
+    use["volume"] = use.get("volume", 0).fillna(0.0)
+    return use[["time", "open", "high", "low", "close", "volume"]].to_dict(orient="records")
+
+
+def _line_json(df: pd.DataFrame, key: str) -> list[dict[str, Any]]:
+    if df.empty or "timestamp" not in df or key not in df:
+        return []
+    use = df[["timestamp", key]].copy()
+    use["timestamp"] = pd.to_numeric(use["timestamp"], errors="coerce")
+    use[key] = pd.to_numeric(use[key], errors="coerce")
+    use = use.dropna()
+    if use.empty:
+        return []
+    use["time"] = (use["timestamp"].astype("int64") // 1000).astype("int64")
+    return use[["time", key]].rename(columns={key: "value"}).to_dict(orient="records")
+
+
+def _ma_json(df: pd.DataFrame, period: int) -> list[dict[str, Any]]:
+    if df.empty or len(df) < period or "close" not in df:
+        return []
+    use = df[["timestamp", "close"]].copy()
+    use["value"] = pd.to_numeric(use["close"], errors="coerce").rolling(period).mean()
+    return _line_json(use, "value")
+
+
+
+
+def _hist_json(df: pd.DataFrame, key: str) -> list[dict[str, Any]]:
+    if df.empty or "timestamp" not in df or key not in df:
+        return []
+    use=df[["timestamp", key]].copy()
+    use["timestamp"]=pd.to_numeric(use["timestamp"], errors="coerce")
+    use[key]=pd.to_numeric(use[key], errors="coerce")
+    use=use.dropna()
+    if use.empty:
+        return []
+    use["time"] = (use["timestamp"].astype("int64") // 1000).astype("int64")
+    return use[["time", key]].rename(columns={key: "value"}).to_dict(orient="records")
+
+
+def _volume_json(df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df.empty or "timestamp" not in df or "volume" not in df:
+        return []
+    use=df.copy()
+    for c in ["timestamp","volume","open","close"]:
+        if c in use: use[c]=pd.to_numeric(use[c], errors="coerce")
+    use=use.dropna(subset=["timestamp","volume"])
+    if use.empty:
+        return []
+    use["time"] = (use["timestamp"].astype("int64") // 1000).astype("int64")
+    use["value"] = use["volume"].fillna(0.0)
+    use["color"] = (use["close"].fillna(0.0) >= use["open"].fillna(0.0)).map(
+        {True: "rgba(34,197,94,.45)", False: "rgba(239,68,68,.45)"}
+    )
+    return use[["time", "value", "color"]].to_dict(orient="records")
+
+
+def _indicator_payload(df: pd.DataFrame, enabled: set[str] | None = None, market_type: str | None = None) -> dict[str, Any]:
+    if df.empty:
+        return {"overlay": {}, "lower": {}, "surge": {"ready": False, "bars": 0}}
+    overlay_keys = {"ema9", "ema21", "ema50", "sma50", "vwap", "bbUpper", "bbMid", "bbLower", "donchianHigh", "donchianLow", "supertrend"}
+    lower_keys = {"volume", "volumeSma20", "rsi14", "macd", "macdSignal", "macdHist", "atr14", "obv", "stochK", "stochD"}
+    active = set(enabled) if enabled is not None else overlay_keys | lower_keys
+    column_keys = {
+        "bbUpper": "bb_upper", "bbMid": "bb_mid", "bbLower": "bb_lower",
+        "donchianHigh": "donchian_high", "donchianLow": "donchian_low",
+        "volumeSma20": "volume_sma20", "macdSignal": "macd_signal",
+        "macdHist": "macd_hist", "stochK": "stoch_k", "stochD": "stoch_d",
+    }
+    requested_columns = {column_keys.get(key, key) for key in active if key != "volume"}
+    d = add_common_indicators(df, include=requested_columns)
+    resolved_market = normalize_market_type(
+        market_type or (df.get("market_type", pd.Series([CRYPTO])).iloc[-1] if "market_type" in df else CRYPTO)
+    )
+    return {
+        "overlay": {
+            key: _line_json(d, column_keys.get(key, key))
+            for key in overlay_keys if key in active
+        },
+        "lower": {
+            key: (_volume_json(d) if key == "volume" else _hist_json(d, column_keys[key]) if key == "macdHist" else _line_json(d, column_keys.get(key, key)))
+            for key in lower_keys if key in active
+        },
+        "surge": surge_snapshot(df, resolved_market),
+    }
+
+def _levels_json(levels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for lv in levels or []:
+        try:
+            start = int(int(lv.get("start_ts")) / 1000)
+            end_raw = lv.get("end_ts") or lv.get("start_ts")
+            end = int(int(end_raw) / 1000)
+            if end <= start:
+                end = start + 1
+            item = {"start": start, "end": end, "side": str(lv.get("side", "")), "setup": str(lv.get("setup", ""))}
+            for k in ("entry", "stop", "target1", "target2", "event_high", "event_low"):
+                if lv.get(k) is not None:
+                    item[k] = _num(lv.get(k))
+            out.append(item)
+        except Exception:
+            continue
+    return out
+
+
+def _trades_json(trades: pd.DataFrame) -> list[dict[str, Any]]:
+    if trades.empty or "timestamp" not in trades:
+        return []
+    out = []
+    for _, r in trades.iterrows():
+        side = str(r.get("side", "")).lower()
+        out.append(
+            {
+                "time": int(int(_num(r.get("timestamp"))) / 1000),
+                "position": "belowBar" if side == "buy" else "aboveBar",
+                "color": "#22c55e" if side == "buy" else "#ef4444",
+                "shape": "arrowUp" if side == "buy" else "arrowDown",
+                "text": f"{side.upper()} {float(_num(r.get('price'))):.2f}",
+                "side": side,
+                "price": _num(r.get("price")),
+                "qty": _num(r.get("qty")),
+                "pnl": _num(r.get("pnl")),
+                "reason": str(r.get("reason", "")),
+            }
+        )
+    return out
+
+
+def _drawdown_json(eq: pd.DataFrame) -> list[dict[str, Any]]:
+    if eq.empty or "equity" not in eq:
+        return []
+    s = pd.to_numeric(eq["equity"], errors="coerce").ffill().bfill()
+    dd = (s / s.cummax() - 1) * 100
+    d = pd.DataFrame({"timestamp": eq["timestamp"], "value": dd})
+    return _line_json(d, "value")
+
+
+def _monthly_returns(eq: pd.DataFrame) -> list[dict[str, Any]]:
+    if eq.empty or "timestamp" not in eq or "equity" not in eq:
+        return []
+    d = eq.copy()
+    d["date"] = pd.to_datetime(d["timestamp"], unit="ms")
+    d = d.set_index("date")
+    m = d["equity"].resample("ME").last().pct_change().dropna() * 100
+    rows = []
+    for ts, v in m.items():
+        rows.append({"year": int(ts.year), "month": int(ts.month), "value": float(v)})
+    return rows
+
+
+def _trade_rows(trades: pd.DataFrame, limit: int = 80) -> list[dict[str, Any]]:
+    if trades.empty:
+        return []
+    rows = []
+    for _, r in trades.tail(limit).iloc[::-1].iterrows():
+        rows.append(
+            {
+                "date": pd.to_datetime(int(_num(r.get("timestamp"))), unit="ms").strftime("%Y-%m-%d %H:%M"),
+                "side": str(r.get("side", "")),
+                "symbol": str(r.get("symbol", "")),
+                "price": _num(r.get("price")),
+                "qty": _num(r.get("qty")),
+                "pnl": _num(r.get("pnl")),
+                "cumPnl": _num(r.get("equity_after", 0)),
+                "reason": str(r.get("reason", "")),
+            }
+        )
+    return rows
+
+
+def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol") or "BTCUSDT").upper()
+    category = _normalize_category(payload.get("category"))
+    market_type = normalize_market_type(payload.get("market_type"), category)
+    interval = str(payload.get("interval") or "1H")
+    strategy_name = str(payload.get("strategy") or "sma_cross")
+    fast = int(payload.get("fast") or 20)
+    slow = int(payload.get("slow") or 60)
+    initial_cash = float(payload.get("initialCash") or 10000)
+    fee_rate = float(payload.get("feeRate") or 0.0006)
+    slippage_rate = float(payload.get("slippageRate") or 0.0002)
+    allow_short = bool(payload.get("allowShort") or False)
+    source = str(payload.get("source") or "local")
+    start = str(payload.get("start") or "2024-01-01")
+    end = _coerce_end_date(payload.get("end"))
+
+    if source == "bitget" and market_type == CRYPTO:
+        if interval.endswith("s"):
+            # Bitget does not provide historical second candles. Seconds are only from saved live ticks.
+            df = _ensure_data(symbol, category, interval, limit=1000)
+        else:
+            # UI backtest uses a bounded, cache-first window to avoid thousands of API calls.
+            # For full offline history use: python -m src.main backfill-full.
+            df, report = load_or_fetch_candles(symbol, category, interval, start, end, limit=1000, source='bitget', repair=True, strict_backtest=True)
+            _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
+    elif source == "toss":
+        if market_type == CRYPTO:
+            raise ValueError("source=toss requires KOR_STOCK or US_STOCK")
+        if interval.endswith("s"):
+            raise ValueError("Toss stock backtests support 1m and larger intervals")
+        df, _ = load_or_fetch_canonical_candles(
+            symbol, category, interval, start, end,
+            limit=1000, fetch=True, persist_derived=True, market_type=market_type,
+        )
+        _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
+    elif source == "demo":
+        df = make_demo_candles(symbol, category, interval)
+        df["market_type"] = market_type
+        _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
+        try: upsert_candles(df, market_type=market_type)
+        except Exception: pass
+    else:
+        df = _ensure_data(symbol, category, interval, limit=1000, market_type=market_type)
+
+    if strategy_name == "sma_cross":
+        strat = make_strategy("sma_cross", symbol=symbol, fast=fast, slow=slow, allow_short=allow_short)
+    elif strategy_name in ("rsi", "rsi_reversal"):
+        strat = make_strategy("rsi", symbol=symbol, period=int(payload.get("rsiPeriod") or 14), lower=float(payload.get("rsiLower") or 30), upper=float(payload.get("rsiUpper") or 70), allow_short=allow_short)
+    elif strategy_name in ("scalp", "scalp_vwap_rsi"):
+        strat = make_strategy("scalp_vwap_rsi", symbol=symbol, allow_short=allow_short,
+                              min_rel_volume=float(payload.get("minRelVolume") or 0.80),
+                              min_atr_pct=float(payload.get("minAtrPct") or 0.03),
+                              stop_atr=float(payload.get("stopAtr") or 1.20),
+                              take_atr=float(payload.get("takeAtr") or 1.80))
+    elif strategy_name in ("price_action_volume", "pa_volume"):
+        strat = make_strategy("price_action_volume", symbol=symbol, allow_short=allow_short,
+                              volume_mult=float(payload.get("volumeMult") or 1.8),
+                              pullback_bars=int(payload.get("pullbackBars") or 13))
+    elif strategy_name in ("multi_timeframe_momentum", "mtf_momentum"):
+        strat = make_strategy("multi_timeframe_momentum", symbol=symbol, allow_short=allow_short,
+                              min_rel_volume=float(payload.get("minRelVolume") or 0.90),
+                              min_atr_pct=float(payload.get("minAtrPct") or 0.035),
+                              stop_atr=float(payload.get("stopAtr") or 1.30),
+                              take_r=float(payload.get("takeAtr") or 2.00))
+    else:
+        strat = make_strategy("breakout", symbol=symbol, window=int(payload.get("breakoutWindow") or 20), allow_short=allow_short)
+
+    result = BacktestEngine(
+        df,
+        strat,
+        initial_cash=initial_cash,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+        allow_short=allow_short,
+        symbol=symbol,
+        category=category,
+        market_type=market_type,
+    ).run()
+    eq = result["equity_curve"]
+    trades = result["trades"]
+    metrics = result["metrics"]
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "category": category,
+        "market_type": market_type,
+        "interval": interval,
+        "candles": _candles_json(df),
+        "maFast": _ma_json(df, fast),
+        "maSlow": _ma_json(df, slow),
+        "markers": _trades_json(trades),
+        "tradeLevels": _levels_json(result.get("trade_levels", [])),
+        "equity": _line_json(eq, "equity"),
+        "drawdown": _drawdown_json(eq),
+        "monthly": _monthly_returns(eq),
+        "trades": _trade_rows(trades),
+        "metrics": metrics,
+        "dataset": result.get("dataset", {}),
+        "rows": int(len(df)),
+        "indicators": _indicator_payload(df),
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse(HTML)
+
+
+@app.get("/api/candles")
+def api_candles(
+    symbol: str = Query("BTCUSDT"),
+    category: str = Query("USDT-FUTURES"),
+    interval: str = Query("1H"),
+    source: str = Query("local"),
+    start: str = Query("2024-01-01"),
+    end: str | None = Query(None),
+    limit: int = Query(1000, ge=1, le=6000),
+    include_indicators: bool = Query(False),
+    market_type: str = Query(CRYPTO),
+):
+    try:
+        category = _normalize_category(category)
+        market_type = normalize_market_type(market_type, category)
+        end = _coerce_end_date(end)
+        if market_type == CRYPTO and source == "bitget":
+            if interval.endswith("s"):
+                df = _ensure_data(symbol, category, interval, limit=1000)
+                report = None
+            elif interval in CANONICAL_INTERVALS:
+                df, report = _refresh_cached_canonical_window(symbol, category, interval, start, end, limit, market_type)
+            else:
+                df = _load_cached_range(symbol, interval, category, start=start, end=end, limit=limit, market_type=market_type)
+                if not df.empty:
+                    report = {"source": "db_cache", "rows": int(len(df))}
+                else:
+                    df, report = load_or_fetch_candles(symbol, category, interval, start, end, limit=limit, source='bitget', repair=True, strict_backtest=False)
+                    _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
+        elif source == "toss":
+            if interval.endswith("s"):
+                raise ValueError("Toss stock charts currently support 1m and larger intervals")
+            if market_type == CRYPTO:
+                raise ValueError("source=toss requires KOR_STOCK or US_STOCK")
+            df, report = _refresh_cached_canonical_window(symbol, category, interval, start, end, limit, market_type)
+        elif source == "demo":
+            df = make_demo_candles(symbol, category, interval)
+            df["market_type"] = market_type
+            _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
+            try: upsert_candles(df, market_type=market_type)
+            except Exception: pass
+            report = None
+        else:
+            df = _ensure_data(symbol, category, interval, limit=limit, market_type=market_type)
+            report = None
+        return {
+            "ok": True,
+            "stale": False,
+            "symbol": symbol.upper(),
+            "category": category,
+            "market_type": market_type,
+            "interval": interval,
+            "rows": int(len(df)),
+            "candles": _candles_json(df),
+            "indicators": _indicator_payload(df) if include_indicators else {"overlay": {}, "lower": {}},
+            "report": report.__dict__ if hasattr(report, "__dict__") else (report or {}),
+        }
+    except Exception as e:
+        cached = _load_local(symbol, interval, category, limit=limit, market_type=market_type)
+        if not cached.empty:
+            return {
+                "ok": True,
+                "stale": True,
+                "error": str(e),
+                "symbol": symbol.upper(),
+                "category": category,
+                "market_type": market_type,
+                "interval": interval,
+                "rows": int(len(cached)),
+                "candles": _candles_json(cached),
+                "indicators": _indicator_payload(cached),
+                "report": {"fallback": "cache"},
+            }
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.post("/api/indicators")
+def api_indicators(payload: dict[str, Any] = Body(...)):
+    """Recompute indicators from the exact candle set currently shown on the chart.
+
+    This keeps overlay indicators, volume, and lower panes tied to the same
+    interval/range after lazy-loading older candles or receiving live updates.
+    """
+    try:
+        symbol = str(payload.get("symbol") or "BTCUSDT").upper()
+        category = _normalize_category(payload.get("category"))
+        market_type = normalize_market_type(payload.get("market_type"), category)
+        interval = str(payload.get("interval") or "1m")
+        candles = payload.get("candles") or []
+        enabled = {str(key) for key in (payload.get("enabled") or [])}
+        df = _df_from_chart_candles(candles[-6000:], symbol=symbol, category=category, interval=interval, market_type=market_type)
+        return {"ok": True, "symbol": symbol, "category": category, "market_type": market_type, "interval": interval, "rows": int(len(df)), "indicators": _indicator_payload(df, enabled or None)}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.get("/api/stocks/universe/status")
+def api_stock_universe_status():
+    """Return local catalog counts without contacting Toss."""
+    return {"ok": True, **stock_universe_status()}
+
+
+@app.get("/api/stocks/search")
+def api_stock_search(
+    q: str = Query("", max_length=80),
+    market_type: str = Query(KOR_STOCK),
+    limit: int = Query(20, ge=1, le=100),
+):
+    try:
+        market_type = normalize_market_type(market_type)
+        if not _is_stock_market(market_type):
+            raise ValueError("Stock search requires KOR_STOCK or US_STOCK")
+        query = str(q or "").strip()
+        return {
+            "ok": True,
+            "market_type": market_type,
+            "query": query,
+            "results": search_stock_symbols(query, market_type, limit=limit),
+            "direct_entry": query.upper() if _is_direct_stock_symbol(query, market_type) else None,
+            "universe": stock_universe_status(),
+        }
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/stocks/select")
+def api_stock_select(payload: dict[str, Any] = Body(...)):
+    """Select a ticker and enrich its local catalog entry from Toss when possible."""
+    try:
+        market_type = normalize_market_type(payload.get("market_type"))
+        if not _is_stock_market(market_type):
+            raise ValueError("Stock selection requires KOR_STOCK or US_STOCK")
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        if not _is_direct_stock_symbol(symbol, market_type):
+            raise ValueError("Invalid stock symbol format")
+        exchange = str(payload.get("exchange") or "").upper().strip() or None
+        stock = ensure_stock_symbol(
+            symbol,
+            market_type,
+            exchange=exchange,
+            name=str(payload.get("name") or "").strip() or None,
+        )
+        # The official Toss API supports metadata lookup for up to 200 known
+        # tickers, not an all-market listing. Enrich direct selections here
+        # without downloading a whole universe during chart loading.
+        try:
+            provider_rows = TossPublicClient().get_stock_info([symbol], market_type)
+            if provider_rows:
+                upsert_stock_symbols(provider_rows, source="toss_stock_info")
+                stock = provider_rows[0]
+        except Exception:
+            # Keep a direct ticker usable when the provider is temporarily
+            # unavailable. Chart loading will expose the specific API error.
+            pass
+        return {
+            "ok": True,
+            "stock": stock,
+            "symbol": stock["symbol"],
+            "category": _stock_candle_category(market_type, stock.get("exchange")),
+            "market_type": market_type,
+        }
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/stocks/universe/refresh")
+def api_stock_universe_refresh(payload: dict[str, Any] = Body(default={})):
+    """Explicitly import a full symbol catalog after Toss contract setup.
+
+    Chart opening never calls this route. That avoids an expensive complete
+    universe API request each time the UI starts.
+    """
+    try:
+        market_type = normalize_market_type(payload.get("market_type") or KOR_STOCK)
+        if not _is_stock_market(market_type):
+            raise ValueError("Stock universe refresh requires KOR_STOCK or US_STOCK")
+        rows = TossPublicClient().download_stock_universe(market_type)
+        inserted = upsert_stock_symbols(rows, source="toss_universe")
+        return {"ok": True, "market_type": market_type, "inserted": inserted, "universe": stock_universe_status()}
+    except TossApiConfigurationError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "hint": "The official Toss API supports lookup for known tickers but does not publish a full-universe endpoint. Use ticker search or import a separately licensed catalog.",
+            },
+            status_code=409,
+        )
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.get("/api/stocks/surge-rankings")
+def api_surge_rankings(
+    market_type: str = Query(KOR_STOCK),
+    limit: int = Query(100, ge=1, le=100),
+):
+    """Read the persisted local-universe price/volume watchlist without network I/O."""
+    try:
+        market = normalize_market_type(market_type)
+        if not _is_stock_market(market):
+            raise ValueError("Surge rankings require KOR_STOCK or US_STOCK")
+        return {"ok": True, **SurgeScanner().snapshot(market, top_n=limit)}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/stocks/surge-rankings/refresh")
+def api_refresh_surge_rankings(payload: dict[str, Any] = Body(default={})):
+    """Refresh one bounded candidate batch, then persist its latest ranking.
+
+    This route is deliberately separate from chart loading.  The browser calls
+    it only while a stock tab is active, and the scanner rotates through a
+    local catalog instead of pretending that Toss exposes a global Top 100.
+    """
+    try:
+        market = normalize_market_type(payload.get("market_type") or KOR_STOCK)
+        if not _is_stock_market(market):
+            raise ValueError("Surge rankings require KOR_STOCK or US_STOCK")
+        max_symbols = max(1, min(int(payload.get("max_symbols", 25)), MAX_BATCH_SIZE))
+        top_n = max(1, min(int(payload.get("top_n", 100)), 100))
+        result = SurgeScanner().refresh(market, max_symbols=max_symbols, top_n=top_n)
+        return {"ok": True, **result.payload(top_n=top_n)}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.get("/api/latest-candles")
+def api_latest_candles(
+    symbol: str = Query("BTCUSDT"),
+    category: str = Query("USDT-FUTURES"),
+    interval: str = Query("1m"),
+    market_type: str = Query(CRYPTO),
+):
+    category = _normalize_category(category)
+    market_type = normalize_market_type(market_type, category)
+    limit = 220 if interval == "2m" else 200 if interval in ("1m", "3m", "5m", "15m", "30m") else 160
+    try:
+        if market_type == CRYPTO:
+            data = BitgetPublicClient().get_recent_candles(symbol, category, interval, limit=limit)
+        else:
+            data = TossPublicClient().get_recent_candles(symbol, category, interval, market_type=market_type, limit=limit)
+        if not data.empty:
+            try:
+                upsert_candles(data, market_type=market_type)
+            except Exception:
+                pass
+            _maybe_save_csv(data, _csv_path(symbol, interval, market_type))
+        try:
+            tail = load_candles(symbol, category, interval, limit=1800, market_type=market_type)
+        except Exception:
+            tail = pd.DataFrame()
+        if tail.empty:
+            tail = data
+        return {"ok": True, "stale": False, "symbol": symbol.upper(), "category": category, "market_type": market_type, "interval": interval, "rows": int(len(tail)), "candles": _candles_json(tail), "indicators": _indicator_payload(tail)}
+    except Exception as e:
+        cached = _load_local(symbol, interval, category, limit=1800, market_type=market_type)
+        if not cached.empty:
+            return {"ok": True, "stale": True, "error": str(e), "symbol": symbol.upper(), "category": category, "market_type": market_type, "interval": interval, "rows": int(len(cached)), "candles": _candles_json(cached), "indicators": _indicator_payload(cached)}
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.post("/api/backtest")
+def api_backtest(payload: dict[str, Any] = Body(...)):
+    try:
+        return _run_backtest_payload(payload)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.get("/api/market/state")
+def api_market_state():
+    return {"ok": True, **MARKET_STATE.snapshot()}
+
+
+@app.post("/api/market/switch")
+async def api_market_switch(payload: dict[str, Any] = Body(...)):
+    try:
+        market_type = normalize_market_type(payload.get("market_type"))
+        return {"ok": True, **(await MARKET_STATE.switch_active(market_type))}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/market/positions")
+async def api_market_positions(payload: dict[str, Any] = Body(...)):
+    """Accept a broker/position-sync count without starting heavy market data."""
+    try:
+        market_type = normalize_market_type(payload.get("market_type"))
+        return {"ok": True, **(await MARKET_STATE.update_known_position_count(market_type, int(payload.get("count") or 0)))}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+async def _ws_live_toss(
+    websocket: WebSocket,
+    *,
+    symbol: str,
+    category: str,
+    interval: str,
+    market_type: str,
+    client_last_time: Any,
+) -> None:
+    """Serve Toss stock live candles using the official REST-only API."""
+    if interval.endswith("s"):
+        await websocket.send_json({"type": "fatal", "message": "Stock live charts support 1m and larger intervals"})
+        return
+    cached, _, _ = _cached_window(symbol, interval, category, limit=1800, market_type=market_type)
+    catchup = pd.DataFrame()
+    warning = ""
+    try:
+        catchup, _ = _repair_live_gap(symbol, category, interval, client_last_time, market_type)
+    except Exception as exc:
+        warning = str(exc)
+    initial = cached
+    client = TossPublicClient()
+    try:
+        recent = await asyncio.to_thread(
+            client.get_recent_candles,
+            symbol,
+            category,
+            "1m",
+            market_type=market_type,
+            limit=200,
+        )
+        if not recent.empty:
+            upsert_candles(recent, market_type=market_type, source="toss_rest")
+            initial, _, _ = _cached_window(symbol, interval, category, limit=1800, market_type=market_type)
+    except Exception as exc:
+        warning = warning or str(exc)
+    if not catchup.empty:
+        await websocket.send_json({"type": "catchup", "transport": "db_gap_repair", "market_type": market_type, "symbol": symbol, "category": category, "interval": interval, "rows": int(len(catchup)), "candles": _candles_json(catchup)})
+    await websocket.send_json({
+        "type": "snapshot",
+        "transport": "toss_rest_poll",
+        "market_type": market_type,
+        "symbol": symbol,
+        "category": category,
+        "interval": interval,
+        "rows": int(len(initial)),
+        "candles": _candles_json(initial),
+        "indicators": {"overlay": {}, "lower": {}},
+        "warning": warning or None,
+    })
+
+    try:
+        # Toss currently exposes REST rather than a market-data WebSocket.
+        # Two seconds stays well below the 5 TPS candle limit while keeping a
+        # forming one-minute bar responsive enough for the live chart.
+        poll_seconds = max(2.0, float(os.getenv("TOSS_LIVE_POLL_SECONDS", "2")))
+        last_snapshot: tuple[Any, ...] | None = None
+        while True:
+            latest_1m = await asyncio.to_thread(
+                client.get_recent_candles,
+                symbol,
+                category,
+                "1m",
+                market_type=market_type,
+                limit=2,
+            )
+            if not latest_1m.empty:
+                upsert_candles(latest_1m, market_type=market_type, source="toss_rest_live")
+                span = max(INTERVAL_MS.get(interval, INTERVAL_MS["1D"]) * 2, 2 * INTERVAL_MS["1m"])
+                latest, _ = load_or_fetch_canonical_candles(
+                    symbol,
+                    category,
+                    interval,
+                    now_ms() - span,
+                    now_ms(),
+                    fetch=False,
+                    persist_derived=True,
+                    market_type=market_type,
+                )
+                if latest.empty:
+                    await asyncio.sleep(poll_seconds)
+                    continue
+                row = latest.iloc[-1]
+                snapshot = tuple(row[key] for key in ("timestamp", "open", "high", "low", "close", "volume"))
+                if snapshot != last_snapshot:
+                    last_snapshot = snapshot
+                    await websocket.send_json({
+                        "type": "candle_update",
+                        "transport": "toss_rest_poll",
+                        "market_type": market_type,
+                        "candle": _candles_json(latest.tail(1))[0],
+                    })
+            await asyncio.sleep(poll_seconds)
+    except TossApiConfigurationError as exc:
+        await websocket.send_json({"type": "status", "transport": "toss_configuration_required", "market_type": market_type, "message": str(exc)})
+    except asyncio.CancelledError:
+        raise
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        await websocket.send_json({"type": "fatal", "message": str(exc)})
+
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    await websocket.accept()
+    params = websocket.query_params
+    symbol = str(params.get("symbol") or "BTCUSDT").upper()
+    category = _normalize_category(params.get("category"))
+    interval = str(params.get("interval") or "1m")
+    market_type = normalize_market_type(params.get("market_type"), category)
+    await MARKET_STATE.switch_active(market_type)
+    current_task = asyncio.current_task()
+    if not await MARKET_STATE.attach_heavy_task(market_type, current_task):
+        return
+    if market_type != CRYPTO:
+        try:
+            await _ws_live_toss(
+                websocket,
+                symbol=symbol,
+                category=category,
+                interval=interval,
+                market_type=market_type,
+                client_last_time=params.get("from"),
+            )
+        finally:
+            await MARKET_STATE.detach_heavy_task(market_type, current_task)
+        return
+    cache_path = str(_csv_path(symbol, interval, market_type))
+    tick_path = str(RAW / f"{symbol.upper()}_ticks.csv")
+    engine = str(params.get("engine") or "auto").lower()
+    catchup = pd.DataFrame()
+    catchup_report: dict[str, Any] = {"source": "live_no_cursor", "rows": 0}
+    catchup_warning = ""
+    try:
+        catchup, catchup_report = _repair_live_gap(symbol, category, interval, params.get("from"), market_type)
+    except Exception as exc:
+        # The existing chart is still valid; a Kline stream can continue even
+        # when a temporary REST repair is unavailable.
+        catchup_warning = str(exc)
+    if interval not in SECOND_INTERVALS and interval != "2m":
+        # Native Kline updates are exchange-authored and therefore remain
+        # timestamp-identical to the Bitget chart. Trade ticks are retained
+        # only for second candles, which Bitget does not publish historically.
+        cached, _, _ = _cached_window(symbol, interval, category, limit=1800, market_type=market_type)
+        stream = LiveCandleStream(StreamConfig(symbol=symbol, category=category, interval=interval, cache_path=cache_path, initial_limit=1200, max_rows=6000))
+        try:
+            initial = stream.initial(cached=cached)
+        except Exception:
+            initial = cached
+    elif interval == "2m":
+        cached, _, _ = _cached_window(symbol, interval, category, limit=1800, market_type=market_type)
+        stream = LiveSyntheticCandleStream(StreamConfig(symbol=symbol, category=category, interval=interval, cache_path=cache_path, initial_limit=1200, max_rows=6000))
+        try:
+            initial = stream.initial(cached=cached)
+        except Exception:
+            initial = cached
+    else:
+        cached = _load_local(symbol, interval, category, limit=1800, market_type=market_type).tail(1800)
+        stream = LiveTickCandleStream(TickStreamConfig(symbol=symbol, category=category, interval=interval, cache_path=cache_path, tick_path=tick_path, initial_limit=1200))
+        initial = stream.initial(cached=cached)
+    try:
+        if not catchup.empty:
+            await websocket.send_json({"type": "catchup", "transport": "db_gap_repair", "symbol": symbol, "category": category, "interval": interval, "rows": int(len(catchup)), "candles": _candles_json(catchup), "report": catchup_report})
+        elif catchup_warning:
+            await websocket.send_json({"type": "status", "transport": "gap_repair_failed", "message": catchup_warning, "rows": 0})
+        await websocket.send_json({"type": "snapshot", "engine": engine, "transport": "rest_or_cache", "symbol": symbol.upper(), "category": category, "interval": interval, "rows": int(len(initial)), "candles": _candles_json(initial), "indicators": {"overlay": {}, "lower": {}}})
+    except Exception as e:
+        cached = _load_local(symbol, interval, category, limit=1800, market_type=market_type).tail(1800)
+        await websocket.send_json({"type": "snapshot", "transport": "cache", "symbol": symbol.upper(), "category": category, "interval": interval, "rows": int(len(cached)), "candles": _candles_json(cached), "indicators": {"overlay": {}, "lower": {}}, "warning": str(e)})
+
+    try:
+        async for event in stream.stream():
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "fatal", "message": str(e)})
+        except Exception:
+            return
+    finally:
+        await MARKET_STATE.detach_heavy_task(market_type, current_task)
+
+
+HTML = r"""
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Bitget Quant System V2</title>
+<script src="/static/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0b0f14;--panel:#111820;--panel2:#16202a;--line:#26313d;--text:#e8eef5;--muted:#8d99a6;--green:#22c55e;--red:#ef4444;--blue:#3b82f6;--yellow:#eab308;--purple:#a855f7}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Segoe UI,Apple SD Gothic Neo,Malgun Gothic,sans-serif;overflow:hidden}button,input,select{font:inherit}.app{height:100vh;display:grid;grid-template-columns:58px 300px 1fr 340px;grid-template-rows:54px 1fr}.rail{grid-row:1/3;background:#070b0f;border-right:1px solid var(--line);padding:10px 8px}.logo{height:38px;border-radius:12px;background:var(--green);color:#041008;display:grid;place-items:center;font-weight:1000}.ico{height:36px;margin-top:12px;border-radius:10px;display:grid;place-items:center;color:#7f8b96}.ico.on{background:#102518;color:var(--green)}.top{grid-column:2/5;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px;padding:8px 12px;background:#0d1319}.tab{padding:8px 10px;border-radius:9px;color:#a9b5bf}.tab.on{background:#14251c;color:#40dc82}.spacer{flex:1}.btn{border:0;border-radius:9px;background:var(--green);color:#031006;font-weight:900;padding:9px 13px;cursor:pointer}.btn.gray{background:#24303b;color:#d7e0e8}.btn.red{background:#51242b;color:#ffd0d5}.btn.blue{background:var(--blue);color:white}.left,.right,.chartWrap{min-height:0}.left{border-right:1px solid var(--line);background:#0d1319;overflow:auto}.right{border-left:1px solid var(--line);background:#0d1319;overflow:auto}.panel{background:var(--panel);border-bottom:1px solid var(--line)}.panel h3{font-size:14px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line)}.box{padding:12px 14px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}.field{margin-bottom:8px}label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}input,select{width:100%;padding:8px;border-radius:8px;background:#0a1016;color:var(--text);border:1px solid #303c49}.check{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid #202a34}.check input{width:auto}.metric{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #202a34}.metric b{font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.green{color:var(--green)}.red{color:var(--red)}.chartWrap{display:grid;grid-template-rows:43px 1fr;background:#0b0f14}.chartHead{display:flex;align-items:center;gap:7px;padding:6px 10px;border-bottom:1px solid var(--line)}.symbol{font-weight:1000;margin-right:6px}.pill{border:1px solid #344250;background:#16212b;color:#d2dbe3;border-radius:8px;padding:5px 8px;cursor:pointer}.pill.on{background:#12341f;border-color:#1f7a4b;color:#40dc82}.chart{min-height:0;height:100%}.status{white-space:pre-wrap;background:#091016;border:1px solid #303c49;border-radius:9px;color:#ccd6df;min-height:70px;padding:9px;font-size:12px;line-height:1.45}.trades{max-height:420px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:7px 8px;border-bottom:1px solid #202a34;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.toast{position:fixed;right:14px;bottom:14px;display:none;max-width:560px;background:#101820;border:1px solid #394656;border-left:4px solid var(--blue);border-radius:10px;padding:12px;z-index:20}.toast.bad{border-left-color:var(--red)}@media(max-width:1180px){body{overflow:auto}.app{display:block;height:auto}.rail{display:none}.top{position:sticky;top:0;z-index:10}.left,.right{border:0}.chartWrap{height:920px}.chart{min-height:760px;height:760px}}
+</style>
+<style>
+.searchRow{display:grid;grid-template-columns:1fr auto;gap:7px}.searchBtn{min-width:72px}.symbolResults{margin-top:8px;max-height:220px;overflow:auto;border-top:1px solid #26313d}.symbolResult{width:100%;display:grid;grid-template-columns:72px 1fr auto;gap:8px;align-items:center;text-align:left;border:0;border-bottom:1px solid #202a34;background:transparent;color:var(--text);padding:9px 2px;cursor:pointer}.symbolResult:hover{background:#14212a}.symbolResult b{font-size:12px}.symbolResult small{display:block;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.catalogMeta{font-size:11px;line-height:1.4}.surgeMetrics .metric b{font-size:12px}.emptySearch{padding:10px 0;color:var(--muted);font-size:12px}.surgeRankHead{display:flex;align-items:center;justify-content:space-between;gap:8px}.surgeRankMeta{font-size:11px;line-height:1.4;margin:8px 0}.surgeRankings{max-height:360px;overflow:auto;border-top:1px solid #26313d}.surgeRankRow{width:100%;display:grid;grid-template-columns:34px 1fr auto;gap:7px;align-items:center;text-align:left;border:0;border-bottom:1px solid #202a34;background:transparent;color:var(--text);padding:8px 1px;cursor:pointer}.surgeRankRow:hover{background:#14212a}.surgeRankRow small{display:block;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.surgeRankScore{text-align:right;color:var(--green);font-variant-numeric:tabular-nums}.surgeRankScore small{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail"><div class="logo">B</div><div class="ico on">↗</div><div class="ico">▦</div><div class="ico">⚙</div></aside>
+  <header class="top"><span class="tab on">Backtest</span><span class="tab">Live</span><span class="tab">Indicators</span><span class="tab">Risk</span><button class="pill marketTab on" data-market="CRYPTO">Crypto</button><button class="pill marketTab" data-market="KOR_STOCK">KR Stocks</button><button class="pill marketTab" data-market="US_STOCK">US Stocks</button><span class="spacer"></span><span class="pill" id="netBadge" title="데이터 연결 상태">READY</span><button class="btn" id="runBtn">백테스트</button><button class="btn blue" id="downloadBtn">Bitget 데이터</button><button class="btn gray" id="liveBtn">실시간 OFF</button><button class="btn red" id="stopBtn">Stop</button></header>
+  <aside class="left">
+    <section class="panel"><h3>전략/데이터</h3><div class="box">
+      <div class="grid2"><div class="field"><label>Symbol</label><input id="symbol" value="BTCUSDT"></div><div class="field"><label>Category</label><input id="category" value="USDT-FUTURES"></div></div>
+      <div class="grid2"><div class="field"><label>Start</label><input id="start" type="date" value="2024-01-01"></div><div class="field"><label>End / Today</label><input id="end" type="date" title="빈 값이면 서버 현재일을 사용합니다."></div></div>
+      <div class="grid2"><div class="field"><label>Interval</label><select id="interval"><option>1s</option><option>3s</option><option>5s</option><option>15s</option><option>30s</option><option>1m</option><option>2m</option><option>3m</option><option>5m</option><option selected>15m</option><option>30m</option><option>1H</option><option>4H</option><option>1D</option><option>1W</option><option>1M</option></select></div><div class="field"><label>Strategy</label><select id="strategy"><option value="multi_timeframe_momentum" selected>Multi TF Momentum</option><option value="price_action_volume">Price Action Volume Pullback</option><option value="scalp_vwap_rsi">Scalp VWAP/EMA/RSI</option><option value="sma_cross">SMA Cross</option><option value="rsi">RSI Reversal</option><option value="breakout">Donchian Breakout</option></select></div></div>
+      <div class="grid2"><div class="field"><label>Initial cash</label><input id="initialCash" value="10000"></div><div class="field"><label>Fee rate</label><input id="feeRate" value="0.0006"></div></div>
+      <div class="grid2"><div class="field"><label>Slippage</label><input id="slippageRate" value="0.0002"></div><div class="field"><label>Allow short</label><select id="allowShort"><option value="false" selected>No</option><option value="true">Yes</option></select></div></div>
+    </div></section>
+    <section class="panel"><h3>전략 파라미터</h3><div class="box">
+      <div class="grid2"><div class="field"><label>PA Volume Mult</label><input id="volumeMult" value="1.80"></div><div class="field"><label>PA Pullback Bars</label><input id="pullbackBars" value="13"></div></div>
+      <div class="grid2"><div class="field"><label>Min rel volume</label><input id="minRelVolume" value="0.90"></div><div class="field"><label>Min ATR %</label><input id="minAtrPct" value="0.035"></div></div>
+      <div class="grid2"><div class="field"><label>Stop ATR</label><input id="stopAtr" value="1.30"></div><div class="field"><label>Take R</label><input id="takeAtr" value="2.00"></div></div>
+    </div></section>
+    <section class="panel"><h3>상단 지표</h3><div class="box" id="overlayToggles"></div></section>
+    <section class="panel"><h3>하단 지표</h3><div class="box" id="lowerToggles"></div></section>
+    <section class="panel" id="stockSearchPanel" hidden><h3>Stock Search</h3><div class="box">
+      <div class="field"><label>Name or ticker</label><div class="searchRow"><input id="stockSearch" autocomplete="off" placeholder="Search local catalog"><button class="pill searchBtn" id="stockSearchBtn" type="button">Search</button></div></div>
+      <div class="muted catalogMeta" id="stockUniverseMeta">Local catalog is loading.</div>
+      <div class="symbolResults" id="stockSearchResults"></div>
+    </div></section>
+  </aside>
+  <main class="chartWrap">
+    <div class="chartHead"><span class="symbol" id="titleSym">BTCUSDT</span><button class="pill" data-range="1s">1s</button><button class="pill" data-range="5s">5s</button><button class="pill" data-range="15s">15s</button><button class="pill" data-range="1m">1m</button><button class="pill" data-range="2m">2m</button><button class="pill" data-range="3m">3m</button><button class="pill" data-range="5m">5m</button><button class="pill on" data-range="15m">15m</button><button class="pill" data-range="1H">1H</button><button class="pill" data-range="1D">1D</button><button class="pill" data-range="1W">1W</button><button class="pill" data-range="1M">1M</button><span class="spacer"></span><button class="pill" id="fitBtn">Fit</button></div>
+    <div class="chart" id="priceChart"></div>
+  </main>
+  <aside class="right">
+    <section class="panel" id="surgePanel" hidden><h3>Momentum Diagnostics</h3><div class="box surgeMetrics" id="surgeMetrics"></div></section>
+    <section class="panel" id="surgeRankPanel" hidden><h3>Top 100 Surge Candidates</h3><div class="box"><div class="surgeRankHead"><button class="pill" id="surgeRefreshBtn" type="button">Refresh</button><span class="muted catalogMeta" id="surgeRankUpdated"></span></div><div class="muted surgeRankMeta" id="surgeRankMeta">Local catalog scope.</div><div class="surgeRankings" id="surgeRankings"></div></div></section>
+    <section class="panel"><h3>성과</h3><div class="box" id="metrics"></div></section>
+    <section class="panel"><h3>리스크</h3><div class="box" id="risk"></div></section>
+    <section class="panel"><h3>상태</h3><div class="box"><div class="status" id="status">대기 중</div></div></section>
+    <section class="panel"><h3>거래 로그</h3><div class="trades"><table><thead><tr><th>Time</th><th>Side</th><th>Price</th><th>PnL</th></tr></thead><tbody id="tradeRows"></tbody></table></div></section>
+  </aside>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+let liveSocket=null,liveWanted=false,lastPayload=null,lastIndicators={overlay:{},lower:{}},markers=[],allCandles=[],tradeLevelSeries=[],loadingOlder=false,olderLoadArmed=false,indicatorTimer=null,syncing=false,lastLogicalRange=null,lastTimeRange=null;
+let candleRequestSeq=0, backtestRequestSeq=0, indicatorRequestSeq=0, liveSeq=0;
+let candleAbort=null, indicatorAbort=null, lastRenderMeta={symbol:'BTCUSDT', interval:'1H', source:'local', stale:false};
+let activeMarketType='CRYPTO';
+function pad2(n){return String(n).padStart(2,'0')}
+function chartTimeSec(t){if(typeof t==='number')return t;if(t&&typeof t==='object')return Date.UTC(t.year,(t.month||1)-1,t.day||1)/1000;return 0}
+function exchangeDateParts(sec){const d=new Date((sec+8*3600)*1000);return [d.getUTCFullYear(),pad2(d.getUTCMonth()+1),pad2(d.getUTCDate()),pad2(d.getUTCHours()),pad2(d.getUTCMinutes()),pad2(d.getUTCSeconds())]}
+function localDateParts(sec){const d=new Date(sec*1000);return [d.getFullYear(),pad2(d.getMonth()+1),pad2(d.getDate()),pad2(d.getHours()),pad2(d.getMinutes()),pad2(d.getSeconds())]}
+function formatChartTime(t){const sec=chartTimeSec(t);const int=$('interval')?.value||'15m';const [y,m,d,h,mi,s]=exchangeDateParts(sec);if(int==='1M')return `${y}-${m}`;if(int==='1D'||int==='1W')return `${y}-${m}-${d}`;return intervalSec()<60?`${m}-${d} ${h}:${mi}:${s}`:`${m}-${d} ${h}:${mi}`}
+const chartOpt={layout:{background:{color:'#0b0f14'},textColor:'#dce5ee',panes:{separatorColor:'#26313d',separatorHoverColor:'#3b82f6',enableResize:true}},grid:{vertLines:{color:'#15202a'},horzLines:{color:'#15202a'}},localization:{timeFormatter:formatChartTime},crosshair:{mode:1},rightPriceScale:{borderColor:'#26313d'},timeScale:{borderColor:'#26313d',timeVisible:true,secondsVisible:true,tickMarkFormatter:formatChartTime},handleScroll:true,handleScale:true};
+const priceChart=LightweightCharts.createChart($('priceChart'), chartOpt);
+function addLwcSeries(kind,options,paneIndex=0){const ctor=LightweightCharts[kind];if(priceChart.addSeries&&ctor)return priceChart.addSeries(ctor,options,paneIndex);if(kind==='CandlestickSeries')return priceChart.addCandlestickSeries(options);if(kind==='LineSeries')return priceChart.addLineSeries(options);return priceChart.addHistogramSeries(options)}
+const candleSeries=addLwcSeries('CandlestickSeries',{upColor:'#22c55e',downColor:'#ef4444',borderUpColor:'#22c55e',borderDownColor:'#ef4444',wickUpColor:'#22c55e',wickDownColor:'#ef4444'},0);
+const candleMarkers=LightweightCharts.createSeriesMarkers?LightweightCharts.createSeriesMarkers(candleSeries,[]):null;
+const charts=[priceChart];
+const overlayDef={ema9:['EMA 9','#f59e0b'],ema21:['EMA 21','#3b82f6'],ema50:['EMA 50','#a855f7'],sma50:['SMA 50','#94a3b8'],vwap:['VWAP','#22c55e'],bbUpper:['Bollinger Upper','#64748b'],bbMid:['Bollinger Mid','#475569'],bbLower:['Bollinger Lower','#64748b'],donchianHigh:['Donchian High','#eab308'],donchianLow:['Donchian Low','#eab308'],supertrend:['SuperTrend','#10b981']};
+const lowerDef={volume:['Volume','hist',1],volumeSma20:['Volume SMA20','line',1],rsi14:['RSI 14','line',2],macd:['MACD','line',2],macdSignal:['MACD Signal','line',2],macdHist:['MACD Hist','hist',2],atr14:['ATR 14','line',2],obv:['OBV','line',2],stochK:['Stoch K','line',2],stochD:['Stoch D','line',2]};
+const defaultOn={ema9:true,ema21:true,vwap:true,volume:true,volumeSma20:true,rsi14:true,macd:true,macdSignal:true,macdHist:true};
+const overlaySeries={}, lowerSeries={};
+function todayIso(){return new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,10)}
+function syncToday(){}
+function lineSeries(color,width=1,paneIndex=0){return addLwcSeries('LineSeries',{color,lineWidth:width,priceLineVisible:false,lastValueVisible:false},paneIndex);}
+function histSeries(paneIndex=1){return addLwcSeries('HistogramSeries',{priceFormat:{type:'volume'},priceLineVisible:false,lastValueVisible:false},paneIndex);}
+function colorFor(k){return {volumeSma20:'#eab308',rsi14:'#a855f7',macd:'#3b82f6',macdSignal:'#f59e0b',atr14:'#22c55e',obv:'#94a3b8',stochK:'#06b6d4',stochD:'#ef4444'}[k]||'#8b95a1'}
+function buildToggles(){let o='';for(const [k,v] of Object.entries(overlayDef)){o+=`<label class="check"><span>${v[0]}</span><input type="checkbox" data-ind="${k}" ${defaultOn[k]?'checked':''}></label>`}$('overlayToggles').innerHTML=o;let l='';for(const [k,v] of Object.entries(lowerDef)){l+=`<label class="check"><span>${v[0]}</span><input type="checkbox" data-lower="${k}" ${defaultOn[k]?'checked':''}></label>`}$('lowerToggles').innerHTML=l;document.querySelectorAll('[data-ind],[data-lower]').forEach(x=>x.onchange=applyIndicators)}
+function sizePanes(){const panes=priceChart.panes?.();if(!panes||!panes.length)return;const h=$('priceChart').clientHeight||760;try{panes[0]?.setHeight(Math.max(320,h-330));panes[1]?.setHeight(150);panes[2]?.setHeight(170)}catch(e){}}
+function ensureSeries(){for(const [k,v] of Object.entries(overlayDef)){if(!overlaySeries[k]) overlaySeries[k]=lineSeries(v[1],k==='vwap'?2:1,0)}for(const [k,v] of Object.entries(lowerDef)){const pane=v[2]||1;if(!lowerSeries[k]) lowerSeries[k]=v[1]==='hist'?histSeries(pane):lineSeries(colorFor(k),k==='rsi14'?2:1,pane)}sizePanes()}
+function breakLineGaps(data){const step=intervalSec();const rows=(data||[]).filter(x=>x&&x.time).sort((a,b)=>a.time-b.time);if(!rows.length)return rows;const out=[rows[0]];for(let i=1;i<rows.length;i++){const prev=rows[i-1],cur=rows[i];if((+cur.time)-(+prev.time)>step*1.5){const t=+prev.time+step;if(t<+cur.time)out.push({time:t})}out.push(cur)}return out}
+function seriesData(k,src,kind){const data=src?.[k]||[];return kind==='line'?breakLineGaps(data):data}
+function applyIndicators(){ensureSeries();for(const k of Object.keys(overlaySeries)){const on=document.querySelector(`[data-ind="${k}"]`)?.checked;overlaySeries[k].setData(on?breakLineGaps(lastIndicators.overlay?.[k]||[]):[])}for(const k of Object.keys(lowerSeries)){const on=document.querySelector(`[data-lower="${k}"]`)?.checked;const kind=lowerDef[k]?.[1]||'';lowerSeries[k].setData(on?seriesData(k,lastIndicators.lower,kind):[])}syncPaneRanges()}
+function enabledIndicatorKeys(){return [...document.querySelectorAll('[data-ind]:checked,[data-lower]:checked')].map(x=>x.dataset.ind||x.dataset.lower)}
+function immediateIndicators(){return {overlay:{},lower:{volume:allCandles.map(c=>({time:c.time,value:c.volume||0,color:c.close>=c.open?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'}))}}}
+function setIncomingIndicators(data){const fallback=immediateIndicators();lastIndicators={overlay:data?.overlay||{},lower:Object.keys(data?.lower||{}).length?(data.lower||{}):fallback.lower}}
+function clearTradeLevels(){for(const s of tradeLevelSeries){try{priceChart.removeSeries(s)}catch(e){}}tradeLevelSeries=[]}
+function setSeriesMarkers(rows){if(candleMarkers?.setMarkers)candleMarkers.setMarkers(rows);else candleSeries.setMarkers?.(rows)}
+function clearAllSeries(){candleSeries.setData([]);setSeriesMarkers([]);clearTradeLevels();for(const s of Object.values(overlaySeries))s.setData([]);for(const s of Object.values(lowerSeries))s.setData([]);allCandles=[];markers=[];lastIndicators={overlay:{},lower:{}}}
+function mergeCandles(a,b){const m=new Map();[...(a||[]),...(b||[])].forEach(c=>{if(c&&c.time)m.set(+c.time,{...c,time:+c.time})});return [...m.values()].sort((x,y)=>x.time-y.time)}
+function setCandles(cs,{keepOnEmpty=false}={}){const clean=(cs||[]).filter(c=>c&&c.time&&Number.isFinite(+c.open)&&Number.isFinite(+c.high)&&Number.isFinite(+c.low)&&Number.isFinite(+c.close)).sort((a,b)=>a.time-b.time);if(!clean.length&&keepOnEmpty&&allCandles.length)return false;allCandles=clean;candleSeries.setData(allCandles);return true}
+function mergeLiveCandles(cs){const beforeLast=allCandles.length?allCandles[allCandles.length-1].time:0;const visible=priceChart.timeScale().getVisibleRange?.();const follow=!!(visible&&beforeLast&&chartTimeSec(visible.to)>=beforeLast-intervalSec()*2);const merged=mergeCandles(allCandles,cs).slice(-6000);if(!setCandles(merged,{keepOnEmpty:true}))return false;const afterLast=allCandles.length?allCandles[allCandles.length-1].time:beforeLast;try{if(visible&&follow&&afterLast>beforeLast){const shift=afterLast-beforeLast;priceChart.timeScale().setVisibleRange({from:chartTimeSec(visible.from)+shift,to:chartTimeSec(visible.to)+shift})}else if(visible){priceChart.timeScale().setVisibleRange(visible)}}catch(e){}return true}
+function filterMarkers(ms){if(!allCandles.length)return [];const lo=allCandles[0].time,hi=allCandles[allCandles.length-1].time;const filtered=(ms||[]).filter(m=>m.time>=lo&&m.time<=hi).slice(-180);const dense=filtered.length>80;return filtered.map(m=>dense?{...m,text:m.side==='buy'?'B':'S'}:m)}
+function setMarkers(ms=[]){markers=ms||[];setSeriesMarkers(filterMarkers(markers).map(m=>({time:m.time,position:m.position,color:m.color,shape:m.shape,text:m.text})))}
+
+function setTradeLevels(levels=[]){
+  clearTradeLevels();
+  if(!allCandles.length)return;
+  const lo=allCandles[0].time, hi=allCandles[allCandles.length-1].time;
+  const defs=[['entry','#e5e7eb',2],['stop','#ef4444',2],['target1','#eab308',1],['target2','#22c55e',1],['event_high','#64748b',1],['event_low','#64748b',1]];
+  for(const lv of (levels||[]).slice(-80)){
+    const start=Math.max(+lv.start||lo,lo), end=Math.min(+lv.end||hi,hi);
+    if(end<lo||start>hi||end<=start)continue;
+    for(const [k,color,w] of defs){
+      if(lv[k]===undefined||lv[k]===null||!Number.isFinite(+lv[k]))continue;
+      const s=lineSeries(color,w,0);
+      s.setData([{time:start,value:+lv[k]},{time:end,value:+lv[k]}]);
+      tradeLevelSeries.push(s);
+    }
+  }
+}
+
+function isoDate(sec){return new Date(sec*1000).toISOString().slice(0,10)}
+function isoUtc(sec){return new Date(sec*1000).toISOString()}
+function intervalSec(){return {"1s":1,"3s":3,"5s":5,"15s":15,"30s":30,"1m":60,"2m":120,"3m":180,"5m":300,"15m":900,"30m":1800,"1H":3600,"4H":14400,"1D":86400,"1W":604800,"1M":2592000}[$('interval').value]||60}
+function chartLimit(){const int=$('interval').value;if(int.endsWith('s'))return 1800;if(int==='1M')return 1200;if(int==='1W')return 2500;return 6000}
+function olderLimit(){return Math.min(2500, chartLimit())}
+function sourceForInterval(){if(activeMarketType!=='CRYPTO')return 'toss';return $('interval').value.endsWith('s')?'local':'bitget'}
+function refreshTitle(){ $('titleSym').textContent=`${$('symbol').value.trim().toUpperCase()} ${$('interval').value}` }
+function applyInitialQuery(){const q=new URLSearchParams(location.search);const v=q.get('interval');if(v&&Array.from($('interval').options).some(o=>o.value===v)){$('interval').value=v}document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('on',x.dataset.range===$('interval').value));refreshTitle()}
+function readRange(chart=priceChart){const ts=chart.timeScale();const lr=ts.getVisibleLogicalRange?.();const tr=ts.getVisibleRange?.();if(lr)lastLogicalRange={from:lr.from,to:lr.to};if(tr)lastTimeRange={from:tr.from,to:tr.to};return {logical:lr,time:tr}}
+function applyRange(chart,{logical=lastLogicalRange,time=lastTimeRange}={}){const ts=chart.timeScale();try{if(logical&&ts.setVisibleLogicalRange){ts.setVisibleLogicalRange(logical);return}if(time)ts.setVisibleRange(time)}catch(e){}}
+function syncPaneRanges(){readRange(priceChart);sizePanes()}
+/* Legacy duplicate handlers retained by an older UI build. The Korean source
+   encoding of that block is not valid JavaScript, and clean replacements are
+   declared below the current live implementation.
+function syncFrom(src,type){return r=>{if(!r||syncing)return;syncing=true;try{if(type==='logical')lastLogicalRange={from:r.from,to:r.to};else lastTimeRange={from:r.from,to:r.to};for(const ch of charts){if(ch!==src)applyRange(ch,{logical:type==='logical'?r:lastLogicalRange,time:type==='time'?r:lastTimeRange})}}catch(e){}finally{setTimeout(()=>syncing=false,0)}if(src===priceChart){const tr=priceChart.timeScale().getVisibleRange?.();if(tr)maybeLoadOlder(tr)}}}
+function pointValue(data,time){const p=(data||[]).find(x=>+x.time===+time);if(!p)return null;return Number.isFinite(+p.value)?+p.value:Number.isFinite(+p.close)?+p.close:Number.isFinite(+p.open)?+p.open:null}
+function bindRangeSync(chart){const ts=chart.timeScale();ts.subscribeVisibleLogicalRangeChange?.(syncFrom(chart,'logical'));ts.subscribeVisibleTimeRangeChange(syncFrom(chart,'time'))}
+charts.forEach(bindRangeSync);
+async function recomputeIndicatorsFromCandles(){if(!allCandles.length)return;const seq=++indicatorRequestSeq;try{if(indicatorAbort)indicatorAbort.abort();indicatorAbort=new AbortController();const p=payload(sourceForInterval());const r=await fetch('/api/indicators',{method:'POST',headers:{'content-type':'application/json'},signal:indicatorAbort.signal,body:JSON.stringify({symbol:p.symbol,category:p.category,market_type:p.market_type,interval:p.interval,candles:allCandles.slice(-6000),enabled:enabledIndicatorKeys()})});const d=await r.json();if(seq!==indicatorRequestSeq)return;if(d.ok&&sameResponseContext(d,p)){setIncomingIndicators(d.indicators);applyIndicators();setNetBadge(lastRenderMeta.stale?'STALE':'READY', lastRenderMeta.stale?'캐시 데이터를 표시 중':'지표 재계산 완료')}}catch(e){if(e.name!=='AbortError')setNetBadge('STALE','지표 재계산 지연: '+e.message)}}
+function scheduleIndicatorRefresh(delay=1800){clearTimeout(indicatorTimer);indicatorTimer=setTimeout(recomputeIndicatorsFromCandles,delay)}
+async function maybeLoadOlder(r){if(!olderLoadArmed||loadingOlder||liveSocket||!allCandles.length||$('interval').value.endsWith('s'))return;const threshold=allCandles[Math.min(50,allCandles.length-1)].time;if(r.from>threshold)return;loadingOlder=true;try{const keepRange=priceChart.timeScale().getVisibleRange?.();const first=allCandles[0].time;const bars=olderLimit();const endSec=first-intervalSec();const startSec=endSec-intervalSec()*bars;const p=payload('bitget');const q=new URLSearchParams({symbol:p.symbol,category:p.category,interval:p.interval,source:'bitget',start:isoUtc(startSec),end:isoUtc(endSec),limit:String(bars)});const res=await fetch('/api/candles?'+q);const d=await res.json();if(d.ok&&sameResponseContext(d,p)&&d.candles?.length){lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'bitget',stale:!!d.stale};setCandles(mergeCandles(d.candles,allCandles),{keepOnEmpty:true});await recomputeIndicatorsFromCandles();if(keepRange)priceChart.timeScale().setVisibleRange(keepRange);setMarkers(markers);setNetBadge(d.stale?'STALE':'READY',d.stale?'과거 데이터 일부 캐시 사용':'과거 데이터 추가 로딩 완료');setStatus(`과거 데이터 추가 rows=${d.rows}
+${p.interval} 기준으로 하단 지표 재계산 완료`)}}catch(e){setNetBadge('STALE','과거 데이터 추가 지연: '+e.message)}finally{setTimeout(()=>loadingOlder=false,1800)}}
+function normalizeCategory(v){const x=(v||'USDT-FUTURES').trim().toUpperCase();return {'USDT-FUTURE':'USDT-FUTURES','USDC-FUTURE':'USDC-FUTURES','COIN-FUTURE':'COIN-FUTURES'}[x]||x}
+function payload(source='local'){syncToday();$('category').value=normalizeCategory($('category').value);return {symbol:$('symbol').value.trim().toUpperCase(),category:normalizeCategory($('category').value),market_type:activeMarketType,interval:$('interval').value,strategy:$('strategy').value,initialCash:+$('initialCash').value,feeRate:+$('feeRate').value,slippageRate:+$('slippageRate').value,allowShort:$('allowShort').value==='true',source,start:$('start').value,end:$('end').value,minRelVolume:+$('minRelVolume').value,minAtrPct:+$('minAtrPct').value,stopAtr:+$('stopAtr').value,takeAtr:+$('takeAtr').value,volumeMult:Number($('volumeMult')?.value||1.8),pullbackBars:Number($('pullbackBars')?.value||13),fast:20,slow:60}}
+function setStatus(s){$('status').textContent=s}
+function setNetBadge(state,msg=''){const b=$('netBadge'); if(!b)return; b.textContent=state; b.title=msg||state; b.style.borderColor=state==='LIVE'?'#22c55e':state==='STALE'?'#eab308':state==='ERROR'?'#ef4444':'#344250'; b.style.color=state==='ERROR'?'#fecaca':state==='STALE'?'#fde68a':'#d2dbe3'}
+function sameResponseContext(d,p){return (!d.symbol||d.symbol===p.symbol)&&(!d.interval||d.interval===p.interval)&&(!d.category||d.category===p.category)&&(!d.market_type||d.market_type===p.market_type)}
+function toast(s,bad=false){const t=$('toast');t.textContent=s;t.className='toast'+(bad?' bad':'');t.style.display='block';setTimeout(()=>t.style.display='none',4200)}function fmt(x,p=2){if(x===undefined||x===null||Number.isNaN(+x))return '-';return (+x).toLocaleString(undefined,{maximumFractionDigits:p})}
+function renderMetrics(m={}){const rows=[['초기자본',m.initial_cash],['최종자본',m.final_equity],['총수익률',m.total_return+'%'],['MDD',m.mdd+'%'],['Sharpe',m.sharpe],['승률',m.win_rate+'%'],['평균 손익비',m.avg_profit_loss_ratio],['Profit Factor',m.profit_factor],['롱 승률',m.long_win_rate+'%'],['숏 승률',m.short_win_rate+'%'],['거래수',m.trade_count]];$('metrics').innerHTML=rows.map(([a,b])=>`<div class="metric"><span>${a}</span><b>${b??'-'}</b></div>`).join('');$('risk').innerHTML=`<div class="metric"><span>수수료/슬리피지 반영</span><b>ON</b></div><div class="metric"><span>Live 주문</span><b class="red">차단 기본값</b></div><div class="metric"><span>전략 후보</span><b>검증 필요</b></div>`}
+function renderTrades(rows=[]){$('tradeRows').innerHTML=rows.map(r=>`<tr><td>${r.date}</td><td class="${r.side==='buy'?'green':'red'}">${r.side}</td><td>${fmt(r.price)}</td><td class="${r.pnl>=0?'green':'red'}">${fmt(r.pnl)}</td></tr>`).join('')}
+function updateLiveLower(c){ensureSeries();if(document.querySelector('[data-lower="volume"]')?.checked&&lowerSeries.volume){const up=c.close>=c.open;lowerSeries.volume.update({time:c.time,value:c.volume||0,color:up?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'})}scheduleIndicatorRefresh()}
+function renderResult(d){olderLoadArmed=false;lastPayload=d;if(!setCandles(d.candles||[],{keepOnEmpty:true})){toast('표시할 캔들이 없습니다.',true);return}setMarkers(d.markers||[]);setTradeLevels(d.tradeLevels||[]);lastIndicators=d.indicators||{overlay:{},lower:{}};applyIndicators();renderMetrics(d.metrics||{});renderTrades(d.trades||[]);$('titleSym').textContent=`${d.symbol} ${d.interval}`;priceChart.timeScale().fitContent();syncPaneRanges();setStatus(`백테스트 완료\nrows=${d.rows}\nstrategy=${$('strategy').value}\nmarkers=${(d.markers||[]).length}`)}
+async function runBacktest(source='local'){closeLive();syncToday();const seq=++backtestRequestSeq;setNetBadge('LOADING','백테스트 실행 중');setStatus('백테스트 실행 중...');try{const p=payload(source);const r=await fetch('/api/backtest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(p)});const d=await r.json();if(seq!==backtestRequestSeq)return;if(!d.ok)throw Error(d.error||'backtest failed');if(!sameResponseContext(d,p))return;renderResult(d);toast('백테스트 완료')}catch(e){if(seq!==backtestRequestSeq)return;setNetBadge('ERROR',e.message);setStatus('오류: '+e.message);toast(e.message,true)}}
+async function loadCandles(source=sourceForInterval(), opts={}){if(!opts.keepLive)closeLive(false);olderLoadArmed=false;syncToday();refreshTitle();const seq=++candleRequestSeq;setNetBadge('LOADING',`${$('interval').value} 캔들 로딩 중`);setStatus('캔들 로딩 중...');try{if(candleAbort)candleAbort.abort();candleAbort=new AbortController();const p=payload(source);const q=new URLSearchParams({symbol:p.symbol,category:p.category,market_type:p.market_type,interval:p.interval,source,start:p.start,end:p.end,limit:String(chartLimit())});const r=await fetch('/api/candles?'+q,{signal:candleAbort.signal});const d=await r.json();if(seq!==candleRequestSeq)return;if(!d.ok)throw Error(d.error);if(!sameResponseContext(d,p))return;if(!setCandles(d.candles||[],{keepOnEmpty:true})){setNetBadge('STALE','새 데이터가 비어 있어 이전 화면을 유지');toast('새 데이터가 비어 있어 기존 차트를 유지합니다.',true);return}setMarkers([]);setTradeLevels([]);lastIndicators=d.indicators||{overlay:{},lower:{}};lastRenderMeta={symbol:p.symbol,interval:p.interval,source,stale:!!d.stale};applyIndicators();priceChart.timeScale().fitContent();syncPaneRanges();setNetBadge(d.stale?'STALE':'READY',d.stale?'API 실패로 캐시 데이터 표시 중':'캔들 로딩 완료
+rows=${d.rows}
+interval=${p.interval}
+end=${p.end}
+stale=${d.stale||false}`)}catch(e){if(e.name==='AbortError')return;if(seq!==candleRequestSeq)return;setNetBadge('ERROR',e.message);setStatus('오류: '+e.message+'\n기존 차트 데이터는 유지됩니다.');toast(e.message,true)}}
+function closeLive(manual=true){if(manual)liveWanted=false;liveSeq++;if(liveSocket){try{liveSocket.close()}catch(e){}liveSocket=null}$('liveBtn').textContent=liveWanted?'실시간 전환 중':'실시간 OFF';if($('netBadge')&&!liveWanted)setNetBadge('READY','실시간 중지')}
+function startLive(){liveWanted=true;closeLive(false);syncToday();refreshTitle();const seq=++liveSeq;const p=payload('local');const q=new URLSearchParams({symbol:p.symbol,category:p.category,interval:p.interval,engine:'tick'});const proto=location.protocol==='https:'?'wss':'ws';liveSocket=new WebSocket(`${proto}://${location.host}/ws/live?${q}`);$('liveBtn').textContent='실시간 ON';setNetBadge('LOADING','실시간 WebSocket 연결 중');setStatus('실시간 WebSocket 연결 중...');liveSocket.onmessage=e=>{if(seq!==liveSeq)return;const d=JSON.parse(e.data);if(d.type==='snapshot'){if(setCandles(d.candles||[],{keepOnEmpty:true})){setMarkers([]);lastIndicators=d.indicators||{overlay:{},lower:{}};if(!Object.keys(lastIndicators.lower||{}).length){lastIndicators.lower={volume:allCandles.map(c=>({time:c.time,value:c.volume||0,color:c.close>=c.open?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'}))}}lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};applyIndicators();priceChart.timeScale().fitContent();syncPaneRanges()}setNetBadge('LIVE','실시간 연결 완료');setStatus(`초기 snapshot rows=${d.rows}`)}else if(d.type==='candle_update'){if(!d.candle||d.candle.time<1)return;allCandles=mergeCandles(allCandles,[d.candle]).slice(-6000);candleSeries.update(d.candle);updateLiveLower(d.candle);syncPaneRanges();setNetBadge('LIVE','마지막 캔들 부분 업데이트 중');setStatus(`실시간 업데이트
+${p.symbol} ${p.interval}
+last=${new Date(d.candle.time*1000).toLocaleString()}
+ticks=${d.tickCount||''}`)}else if(d.type==='status'){setNetBadge('STALE',d.message||'재연결/대기 중');setStatus(`${d.transport}
+${d.message}`)}else if(d.type==='fatal'){setNetBadge('ERROR',d.message);toast(d.message,true)}};liveSocket.onclose=()=>{if(seq===liveSeq){liveSocket=null;$('liveBtn').textContent=liveWanted?'실시간 재연결 대기':'실시간 OFF';setNetBadge('STALE','실시간 연결 종료, 기존 차트 유지')}};liveSocket.onerror=()=>{setNetBadge('STALE','WebSocket 일시 오류, 재시도/캐시 유지');toast('WebSocket 오류',true)}}
+function resize(){priceChart.applyOptions({width:$('priceChart').clientWidth,height:$('priceChart').clientHeight});sizePanes();syncPaneRanges()}
+async function setIntervalAndLoad(v){document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('on',x.dataset.range===v));$('interval').value=v;refreshTitle();setNetBadge('LOADING',`${v} 데이터 전환 중`);const keep=liveWanted||!!liveSocket;if(keep){closeLive(false);await loadCandles(sourceForInterval(),{keepLive:true});startLive()}else{await loadCandles(sourceForInterval())}}
+*/
+async function loadCandles(source=sourceForInterval(), opts={}){
+  if(!opts.keepLive)closeLive(false);
+  olderLoadArmed=false;syncToday();refreshTitle();
+  const seq=++candleRequestSeq;
+  setNetBadge('LOADING',`${$('interval').value} candles loading`);setStatus('Loading candles...');
+  try{
+    if(candleAbort)candleAbort.abort();
+    candleAbort=new AbortController();
+    const p=payload(source);
+    const q=new URLSearchParams({symbol:p.symbol,category:p.category,market_type:p.market_type,interval:p.interval,source,start:p.start,end:p.end,limit:String(chartLimit()),include_indicators:'false'});
+    const r=await fetch('/api/candles?'+q,{signal:candleAbort.signal});
+    const d=await r.json();
+    if(seq!==candleRequestSeq)return;
+    if(!d.ok)throw Error(d.error||'candle load failed');
+    if(!sameResponseContext(d,p))return;
+    if(!setCandles(d.candles||[],{keepOnEmpty:true}))throw Error('empty candle response');
+    setMarkers([]);setTradeLevels([]);setIncomingIndicators(d.indicators);
+    lastRenderMeta={symbol:p.symbol,interval:p.interval,source,stale:!!d.stale};
+    applyIndicators();priceChart.timeScale().fitContent();syncPaneRanges();
+    scheduleIndicatorRefresh(25);
+    setNetBadge(d.stale?'STALE':'READY',d.stale?'cached data shown':'candles loaded');
+    setStatus(`Candles ready\nrows=${d.rows}\ninterval=${p.interval}\ncache=${d.report?.source||'unknown'}`);
+  }catch(e){
+    if(e.name==='AbortError'||seq!==candleRequestSeq)return;
+    setNetBadge('ERROR',e.message);setStatus('Candle load error: '+e.message);toast(e.message,true);
+  }
+}
+function startLive(){
+  liveWanted=true;closeLive(false);syncToday();refreshTitle();
+  const seq=++liveSeq;const p=payload(sourceForInterval());
+  const chartLastTime=allCandles.length?allCandles[allCandles.length-1].time:0;
+  const q=new URLSearchParams({symbol:p.symbol,category:p.category,market_type:p.market_type,interval:p.interval,engine:'auto',from:String(chartLastTime)});
+  const proto=location.protocol==='https:'?'wss':'ws';
+  liveSocket=new WebSocket(`${proto}://${location.host}/ws/live?${q}`);
+  $('liveBtn').textContent='Live ON';setNetBadge('LOADING','Live WebSocket connecting');setStatus('Live WebSocket connecting...');
+  liveSocket.onmessage=e=>{
+    if(seq!==liveSeq)return;
+    const d=JSON.parse(e.data);
+    if(d.type==='catchup'){
+      if(mergeLiveCandles(d.candles||[])){
+        lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};
+        scheduleIndicatorRefresh(25);
+      }
+      setNetBadge('LOADING','Filling chart gap');setStatus(`Live gap repair\nrows=${d.rows}\nfetched1m=${d.report?.fetched_1m||0}`);
+    }else if(d.type==='snapshot'){
+      const hadCandles=allCandles.length>0;
+      if(mergeLiveCandles(d.candles||[])){
+        if(!hadCandles)setIncomingIndicators(d.indicators);
+        lastRenderMeta={symbol:p.symbol,interval:p.interval,source:'live',stale:false};
+        if(!hadCandles)priceChart.timeScale().fitContent();
+        applyIndicators();syncPaneRanges();scheduleIndicatorRefresh(25);
+      }
+      setNetBadge('LIVE','Exchange Kline stream connected');setStatus(`Live connected\nrows=${d.rows}\nchart preserved=${hadCandles}`);
+    }else if(d.type==='candle_update'){
+      if(!d.candle||d.candle.time<1)return;
+      mergeLiveCandles([d.candle]);updateLiveLower(d.candle);syncPaneRanges();
+      setNetBadge('LIVE','Current exchange candle updating');
+      setStatus(`Live update\n${p.symbol} ${p.interval}\nlast=${formatChartTime(d.candle.time)}\ntransport=${d.transport||'websocket'}`);
+    }else if(d.type==='status'){
+      setNetBadge('STALE',d.message||'reconnecting');setStatus(`${d.transport||'live'}\n${d.message||''}`);
+    }else if(d.type==='fatal'){
+      setNetBadge('ERROR',d.message);toast(d.message,true);
+    }
+  };
+  liveSocket.onclose=()=>{if(seq===liveSeq){liveSocket=null;$('liveBtn').textContent=liveWanted?'Reconnecting':'Live OFF';setNetBadge('STALE','Live connection closed')}};
+  liveSocket.onerror=()=>{setNetBadge('STALE','WebSocket temporary error')};
+}
+function normalizeCategory(value){const text=String(value||'USDT-FUTURES').trim().toUpperCase();return {"USDT-FUTURE":"USDT-FUTURES","USDC-FUTURE":"USDC-FUTURES","COIN-FUTURE":"COIN-FUTURES"}[text]||text}
+function payload(source='local'){syncToday();const category=normalizeCategory($('category').value);$('category').value=category;return {symbol:$('symbol').value.trim().toUpperCase(),category,market_type:activeMarketType,interval:$('interval').value,strategy:$('strategy').value,initialCash:+$('initialCash').value,feeRate:+$('feeRate').value,slippageRate:+$('slippageRate').value,allowShort:$('allowShort').value==='true',source,start:$('start').value,end:$('end').value,minRelVolume:+$('minRelVolume').value,minAtrPct:+$('minAtrPct').value,stopAtr:+$('stopAtr').value,takeAtr:+$('takeAtr').value,volumeMult:Number($('volumeMult')?.value||1.8),pullbackBars:Number($('pullbackBars')?.value||13),fast:20,slow:60}}
+function setStatus(value){$('status').textContent=value}
+function setNetBadge(state,message=''){const badge=$('netBadge');if(!badge)return;badge.textContent=state;badge.title=message||state;badge.style.borderColor=state==='LIVE'?'#22c55e':state==='STALE'?'#eab308':state==='ERROR'?'#ef4444':'#344250';badge.style.color=state==='ERROR'?'#fecaca':state==='STALE'?'#fde68a':'#d2dbe3'}
+function sameResponseContext(data,request){return (!data.symbol||data.symbol===request.symbol)&&(!data.interval||data.interval===request.interval)&&(!data.category||data.category===request.category)&&(!data.market_type||data.market_type===request.market_type)}
+function toast(message,bad=false){const node=$('toast');node.textContent=message;node.className='toast'+(bad?' bad':'');node.style.display='block';setTimeout(()=>node.style.display='none',4200)}
+function fmt(value,precision=2){if(value===undefined||value===null||Number.isNaN(+value))return '-';return (+value).toLocaleString(undefined,{maximumFractionDigits:precision})}
+function renderMetrics(metrics={}){const rows=[['Initial cash',metrics.initial_cash],['Final equity',metrics.final_equity],['Return',metrics.total_return===undefined?'-':metrics.total_return+'%'],['MDD',metrics.mdd===undefined?'-':metrics.mdd+'%'],['Sharpe',metrics.sharpe],['Win rate',metrics.win_rate===undefined?'-':metrics.win_rate+'%'],['Profit factor',metrics.profit_factor],['Trades',metrics.trade_count]];$('metrics').innerHTML=rows.map(([name,value])=>`<div class="metric"><span>${name}</span><b>${value??'-'}</b></div>`).join('');$('risk').innerHTML='<div class="metric"><span>Live orders</span><b class="red">Blocked by default</b></div><div class="metric"><span>Inactive markets</span><b>REST risk polling only when positioned</b></div>'}
+function renderTrades(rows=[]){$('tradeRows').innerHTML=rows.map(row=>`<tr><td>${row.date||''}</td><td class="${row.side==='buy'?'green':'red'}">${row.side||''}</td><td>${fmt(row.price)}</td><td class="${row.pnl>=0?'green':'red'}">${fmt(row.pnl)}</td></tr>`).join('')}
+function renderResult(data){olderLoadArmed=false;lastPayload=data;if(!setCandles(data.candles||[],{keepOnEmpty:true})){toast('No candles available for backtest',true);return}setMarkers(data.markers||[]);setTradeLevels(data.tradeLevels||[]);lastIndicators=data.indicators||{overlay:{},lower:{}};applyIndicators();renderMetrics(data.metrics||{});renderTrades(data.trades||[]);$('titleSym').textContent=`${data.symbol} ${data.interval}`;priceChart.timeScale().fitContent();syncPaneRanges();setStatus(`Backtest complete\nrows=${data.rows}\nstrategy=${$('strategy').value}`)}
+async function runBacktest(source='local'){closeLive();syncToday();const seq=++backtestRequestSeq;setNetBadge('LOADING','Backtest running');setStatus('Backtest running...');try{const request=payload(source);const response=await fetch('/api/backtest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});const data=await response.json();if(seq!==backtestRequestSeq)return;if(!data.ok)throw Error(data.error||'backtest failed');if(!sameResponseContext(data,request))return;renderResult(data);toast('Backtest complete')}catch(error){if(seq!==backtestRequestSeq)return;setNetBadge('ERROR',error.message);setStatus('Backtest error: '+error.message);toast(error.message,true)}}
+function updateLiveLower(candle){ensureSeries();if(document.querySelector('[data-lower="volume"]')?.checked&&lowerSeries.volume){const up=candle.close>=candle.open;lowerSeries.volume.update({time:candle.time,value:candle.volume||0,color:up?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'})}scheduleIndicatorRefresh()}
+async function recomputeIndicatorsFromCandles(){if(!allCandles.length)return;const seq=++indicatorRequestSeq;try{if(indicatorAbort)indicatorAbort.abort();indicatorAbort=new AbortController();const request=payload(sourceForInterval());const response=await fetch('/api/indicators',{method:'POST',headers:{'content-type':'application/json'},signal:indicatorAbort.signal,body:JSON.stringify({symbol:request.symbol,category:request.category,market_type:request.market_type,interval:request.interval,candles:allCandles.slice(-6000),enabled:enabledIndicatorKeys()})});const data=await response.json();if(seq!==indicatorRequestSeq)return;if(data.ok&&sameResponseContext(data,request)){setIncomingIndicators(data.indicators);applyIndicators();setNetBadge(lastRenderMeta.stale?'STALE':'READY',lastRenderMeta.stale?'Cached chart data':'Indicators refreshed')}}catch(error){if(error.name!=='AbortError')setNetBadge('STALE','Indicator refresh delayed: '+error.message)}}
+function scheduleIndicatorRefresh(delay=1800){clearTimeout(indicatorTimer);indicatorTimer=setTimeout(recomputeIndicatorsFromCandles,delay)}
+function closeLive(manual=true){if(manual)liveWanted=false;liveSeq++;if(liveSocket){try{liveSocket.close()}catch(error){}liveSocket=null}$('liveBtn').textContent=liveWanted?'Reconnecting':'Live OFF';if(!liveWanted)setNetBadge('READY','Live stopped')}
+function resize(){priceChart.applyOptions({width:$('priceChart').clientWidth,height:$('priceChart').clientHeight});sizePanes();syncPaneRanges()}
+async function setIntervalAndLoad(value){if(activeMarketType!=='CRYPTO'&&value.endsWith('s'))value='1m';document.querySelectorAll('[data-range]').forEach(node=>node.classList.toggle('on',node.dataset.range===value));$('interval').value=value;refreshTitle();const keep=liveWanted||!!liveSocket;if(keep){closeLive(false);await loadCandles(sourceForInterval(),{keepLive:true});startLive()}else{await loadCandles(sourceForInterval())}}
+async function maybeLoadOlder(r){if(!olderLoadArmed||loadingOlder||liveSocket||!allCandles.length||$('interval').value.endsWith('s'))return;const threshold=allCandles[Math.min(50,allCandles.length-1)].time;if(r.from>threshold)return;loadingOlder=true;try{const keepRange=priceChart.timeScale().getVisibleRange?.();const first=allCandles[0].time;const bars=olderLimit();const endSec=first-intervalSec();const startSec=endSec-intervalSec()*bars;const source=sourceForInterval();const request=payload(source);const query=new URLSearchParams({symbol:request.symbol,category:request.category,market_type:request.market_type,interval:request.interval,source,start:isoUtc(startSec),end:isoUtc(endSec),limit:String(bars)});const response=await fetch('/api/candles?'+query);const data=await response.json();if(data.ok&&sameResponseContext(data,request)&&data.candles?.length){lastRenderMeta={symbol:request.symbol,interval:request.interval,source,stale:!!data.stale};setCandles(mergeCandles(data.candles,allCandles),{keepOnEmpty:true});await recomputeIndicatorsFromCandles();if(keepRange)priceChart.timeScale().setVisibleRange(keepRange);setMarkers(markers);setNetBadge(data.stale?'STALE':'READY',data.stale?'Cached history shown':'Older candles loaded')}}catch(error){setNetBadge('STALE','Older candle load delayed: '+error.message)}finally{setTimeout(()=>loadingOlder=false,1800)}}
+function setMarketDefaults(market){const isCrypto=market==='CRYPTO';if(market==='CRYPTO'){$('symbol').value='BTCUSDT';$('category').value='USDT-FUTURES'}else if(market==='KOR_STOCK'){$('symbol').value='005930';$('category').value='KRX'}else{$('symbol').value='AAPL';$('category').value='NASDAQ'}if(!isCrypto&&$('interval').value.endsWith('s'))$('interval').value='1m';document.querySelectorAll('.marketTab').forEach(b=>b.classList.toggle('on',b.dataset.market===market));refreshTitle()}
+async function switchMarket(market){if(market===activeMarketType)return;closeLive(true);setNetBadge('LOADING','Switching market resources');try{const r=await fetch('/api/market/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:market})});const d=await r.json();if(!d.ok)throw Error(d.error||'market switch failed');activeMarketType=market;setMarketDefaults(market);await loadCandles(sourceForInterval());setStatus(`Market active: ${market}\nInactive streams disconnected\nRisk polling remains only for open positions`)}catch(e){setNetBadge('ERROR',e.message);setStatus('Market switch error: '+e.message);toast(e.message,true)}}
+buildToggles();ensureSeries();applyInitialQuery();syncToday();setNetBadge('READY','초기화 완료');window.addEventListener('resize',resize);['wheel','pointerdown','touchstart'].forEach(ev=>$('priceChart').addEventListener(ev,()=>{olderLoadArmed=true},{passive:true}));setTimeout(resize,50);document.querySelectorAll('[data-range]').forEach(b=>b.onclick=()=>setIntervalAndLoad(b.dataset.range));document.querySelectorAll('.marketTab').forEach(b=>b.onclick=()=>switchMarket(b.dataset.market));$('interval').onchange=()=>setIntervalAndLoad($('interval').value);$('start').onchange=()=>loadCandles(sourceForInterval());$('end').onchange=()=>loadCandles(sourceForInterval());$('category').onchange=()=>{$('category').value=normalizeCategory($('category').value);loadCandles(sourceForInterval())};$('runBtn').onclick=()=>runBacktest(activeMarketType==='CRYPTO'?'local':'toss');$('downloadBtn').onclick=()=>runBacktest(sourceForInterval());$('liveBtn').onclick=()=>liveSocket||liveWanted?closeLive(true):startLive();$('stopBtn').onclick=()=>closeLive(true);$('fitBtn').onclick=()=>{olderLoadArmed=false;priceChart.timeScale().fitContent();syncPaneRanges()};loadCandles(sourceForInterval());
+function marketTimezone(){return activeMarketType==='KOR_STOCK'?'Asia/Seoul':activeMarketType==='US_STOCK'?'America/New_York':'Asia/Shanghai'}
+function exchangeDateParts(sec){const parts=new Intl.DateTimeFormat('en-CA',{timeZone:marketTimezone(),year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(sec*1000));const map={};parts.forEach(part=>{map[part.type]=part.value});return [map.year,map.month,map.day,map.hour,map.minute,map.second]}
+function formatChartTime(t){const sec=chartTimeSec(t);const interval=$('interval')?.value||'15m';const parts=exchangeDateParts(sec);const y=parts[0],m=parts[1],d=parts[2],h=parts[3],mi=parts[4],s=parts[5];if(interval==='1M')return y+'-'+m;if(interval==='1D'||interval==='1W')return y+'-'+m+'-'+d;return intervalSec()<60?m+'-'+d+' '+h+':'+mi+':'+s:m+'-'+d+' '+h+':'+mi}
+function setIncomingIndicators(data){const fallback=immediateIndicators();lastIndicators={overlay:data?.overlay||{},lower:Object.keys(data?.lower||{}).length?(data.lower||{}):fallback.lower};renderSurge(data?.surge||{})}
+function renderSurge(data={}){const panel=$('surgePanel');if(!panel)return;const stock=activeMarketType!=='CRYPTO';panel.hidden=!stock;if(!stock)return;const pct=value=>value===undefined||value===null?'-':fmt(value,2)+'%';const ratio=value=>value===undefined||value===null?'-':fmt(value,2)+'x';const rows=[['Rel volume (20)',ratio(data.relative_volume20)],['Volume z-score',fmt(data.volume_zscore20,2)],['Turnover',fmt(data.turnover_value,0)],['1 / 5 / 15 bar move',pct(data.price_change_1_pct)+' / '+pct(data.price_change_5_pct)+' / '+pct(data.price_change_15_pct)],['Range / ATR',pct(data.range_pct)+' / '+pct(data.atr_pct)],['Session VWAP deviation',pct(data.vwap_deviation_pct)],['20-bar breakout',pct(data.breakout_20_pct)]];$('surgeMetrics').innerHTML=rows.map(row=>'<div class="metric"><span>'+row[0]+'</span><b>'+row[1]+'</b></div>').join('')}
+var stockSearchTimer=null,stockSearchAbort=null;
+var marketSelections={KOR_STOCK:{symbol:'005930',category:'KRX'},US_STOCK:{symbol:'AAPL',category:'NASDAQ'}};
+var surgeRankingTimer=null,surgeRankingAbort=null,surgeRefreshPending=false;
+function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}
+function stockMarketActive(){return activeMarketType==='KOR_STOCK'||activeMarketType==='US_STOCK'}
+function rememberMarketSelection(){if(stockMarketActive()){marketSelections[activeMarketType]={symbol:$('symbol').value.trim().toUpperCase(),category:normalizeCategory($('category').value)}}}
+function stopSurgeRankingPolling(){if(surgeRankingTimer){clearInterval(surgeRankingTimer);surgeRankingTimer=null}if(surgeRankingAbort){surgeRankingAbort.abort();surgeRankingAbort=null}surgeRefreshPending=false}
+function surgeNumber(value,digits=2){const number=Number(value);return Number.isFinite(number)?number.toFixed(digits):'-'}
+function renderSurgeRankings(data={}){const meta=$('surgeRankMeta'),rows=$('surgeRankings'),updated=$('surgeRankUpdated');if(!meta||!rows)return;const total=Number(data.catalog_total||0),scanned=Number(data.cycle_scanned||0),batch=Number(data.scanned_this_run||0);const scope=data.is_global_universe?'Full market universe':'Local catalog only';meta.textContent=scope+' | coverage '+scanned+'/'+total+' | latest batch '+batch+(data.cycle_complete?' | cycle complete':' | rotating');updated.textContent=data.last_run_at?new Date(Number(data.last_run_at)).toLocaleTimeString():'Not scanned';const items=(data.rankings||[]).map((row,index)=>{const metrics=row.metrics||{};const name=row.name||row.name_en||row.symbol;const move=surgeNumber(metrics.price_change_5_pct,2);const volume=surgeNumber(metrics.relative_volume20,2);return '<button class="surgeRankRow" type="button" data-surge-symbol="'+escapeHtml(row.symbol)+'" data-surge-exchange="'+escapeHtml(row.exchange||'')+'"><b>#'+String(index+1)+'</b><span><b>'+escapeHtml(row.symbol)+'</b><small>'+escapeHtml(name)+'</small><small>5 bar '+move+'% | volume '+volume+'x</small></span><span class="surgeRankScore">'+surgeNumber(row.score,2)+'<small>score</small></span></button>'});rows.innerHTML=items.length?items.join(''):'<div class="emptySearch">No ranked candidates yet. Each symbol needs 20 regular-session 1m candles.</div>';rows.querySelectorAll('[data-surge-symbol]').forEach(button=>button.onclick=()=>selectStock({symbol:button.dataset.surgeSymbol,exchange:button.dataset.surgeExchange,name:button.dataset.surgeSymbol}))}
+async function loadSurgeRankings(refresh=false){if(!stockMarketActive()||surgeRefreshPending)return;if(surgeRankingAbort)surgeRankingAbort.abort();surgeRankingAbort=new AbortController();surgeRefreshPending=refresh;try{let response;if(refresh){response=await fetch('/api/stocks/surge-rankings/refresh',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:activeMarketType,max_symbols:25,top_n:100}),signal:surgeRankingAbort.signal})}else{response=await fetch('/api/stocks/surge-rankings?'+new URLSearchParams({market_type:activeMarketType,limit:'100'}),{signal:surgeRankingAbort.signal})}const data=await response.json();if(!data.ok)throw Error(data.error||'surge scan failed');if(data.market_type!==activeMarketType)return;renderSurgeRankings(data)}catch(error){if(error.name!=='AbortError'){$('surgeRankMeta').textContent='Surge scan unavailable: '+error.message}}finally{surgeRefreshPending=false;if(surgeRankingAbort?.signal.aborted===false)surgeRankingAbort=null}}
+function startSurgeRankingPolling(){stopSurgeRankingPolling();if(!stockMarketActive())return;loadSurgeRankings(true);surgeRankingTimer=setInterval(()=>loadSurgeRankings(true),60000)}
+function renderStockSearch(data={}){const results=$('stockSearchResults');if(!results)return;const rows=data.results||[];const query=String(data.query||'').trim();const items=rows.map(row=>'<button class="symbolResult" type="button" data-stock-symbol="'+escapeHtml(row.symbol)+'" data-stock-exchange="'+escapeHtml(row.exchange)+'" data-stock-name="'+escapeHtml(row.name||row.name_en||row.symbol)+'"><b>'+escapeHtml(row.symbol)+'</b><span><small>'+escapeHtml(row.name||row.name_en||row.symbol)+'</small><small>'+escapeHtml(row.exchange)+' | '+escapeHtml(row.currency||'')+'</small></span><small>'+escapeHtml(row.status||'')+'</small></button>');if(!items.length&&data.direct_entry){items.push('<button class="symbolResult" type="button" data-stock-symbol="'+escapeHtml(data.direct_entry)+'" data-stock-exchange="" data-stock-name="'+escapeHtml(data.direct_entry)+'"><b>'+escapeHtml(data.direct_entry)+'</b><span><small>Open manually entered ticker</small><small>Provider metadata pending</small></span><small>open</small></button>')}results.innerHTML=items.length?items.join(''):'<div class="emptySearch">'+(query?'No local match. A valid ticker can be opened directly.':'No local stock catalog yet. Import it after the approved Toss symbol API is configured.')+'</div>';results.querySelectorAll('[data-stock-symbol]').forEach(button=>button.onclick=()=>selectStock({symbol:button.dataset.stockSymbol,exchange:button.dataset.stockExchange,name:button.dataset.stockName}))}
+async function searchStockSymbols(query=$('stockSearch')?.value||''){if(!stockMarketActive())return;if(stockSearchAbort)stockSearchAbort.abort();stockSearchAbort=new AbortController();try{const response=await fetch('/api/stocks/search?'+new URLSearchParams({market_type:activeMarketType,q:query,limit:'30'}),{signal:stockSearchAbort.signal});const data=await response.json();if(!data.ok)throw Error(data.error||'stock search failed');if(data.market_type!==activeMarketType)return;const counts=data.universe?.markets?.[activeMarketType]||{};$('stockUniverseMeta').textContent='Local catalog: '+(counts.total||0)+' symbols, verified tradeable: '+(counts.tradeable||0)+'. Provider import is explicit and is not triggered by chart loading.';renderStockSearch(data)}catch(error){if(error.name!=='AbortError'){$('stockUniverseMeta').textContent='Stock search unavailable: '+error.message}}}
+async function selectStock(stock){if(!stockMarketActive())return;closeLive(true);try{const response=await fetch('/api/stocks/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:activeMarketType,symbol:stock.symbol,exchange:stock.exchange||undefined,name:stock.name||undefined})});const data=await response.json();if(!data.ok)throw Error(data.error||'stock selection failed');$('symbol').value=data.symbol;$('category').value=data.category;marketSelections[activeMarketType]={symbol:data.symbol,category:data.category};$('stockSearch').value=data.symbol;refreshTitle();await loadCandles(sourceForInterval());setStatus('Selected '+data.symbol+' '+data.category+'\nCache-first candle loading is active.\nOnly missing regular-session candles will be requested when Toss data is configured.')}catch(error){setNetBadge('ERROR',error.message);setStatus('Stock selection error: '+error.message);toast(error.message,true)}}
+function updateStockPanels(){const stock=stockMarketActive();$('stockSearchPanel').hidden=!stock;$('surgePanel').hidden=!stock;$('surgeRankPanel').hidden=!stock;priceChart.applyOptions({localization:{timeFormatter:formatChartTime},timeScale:{tickMarkFormatter:formatChartTime}});if(!stock){stopSurgeRankingPolling();return}const placeholder=activeMarketType==='KOR_STOCK'?'Search name or 6-digit ticker':'Search company or US ticker';$('stockSearch').placeholder=placeholder;searchStockSymbols($('stockSearch').value);startSurgeRankingPolling()}
+function setMarketDefaults(market){const isCrypto=market==='CRYPTO';if(market==='CRYPTO'){$('symbol').value='BTCUSDT';$('category').value='USDT-FUTURES'}else{const selected=marketSelections[market]||{symbol:market==='KOR_STOCK'?'005930':'AAPL',category:market==='KOR_STOCK'?'KRX':'NASDAQ'};$('symbol').value=selected.symbol;$('category').value=selected.category}if(!isCrypto&&$('interval').value.endsWith('s'))$('interval').value='1m';document.querySelectorAll('.marketTab').forEach(button=>button.classList.toggle('on',button.dataset.market===market));refreshTitle();updateStockPanels()}
+async function switchMarket(market){if(market===activeMarketType)return;rememberMarketSelection();closeLive(true);setNetBadge('LOADING','Switching market resources');try{const response=await fetch('/api/market/switch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({market_type:market})});const data=await response.json();if(!data.ok)throw Error(data.error||'market switch failed');activeMarketType=market;setMarketDefaults(market);await loadCandles(sourceForInterval());setStatus('Market active: '+market+'\nInactive streams disconnected\nRisk polling remains only for open positions')}catch(error){setNetBadge('ERROR',error.message);setStatus('Market switch error: '+error.message);toast(error.message,true)}}
+updateStockPanels();
+$('stockSearch').oninput=()=>{clearTimeout(stockSearchTimer);stockSearchTimer=setTimeout(()=>searchStockSymbols(),180)};
+$('stockSearchBtn').onclick=()=>searchStockSymbols();
+$('surgeRefreshBtn').onclick=()=>loadSurgeRankings(true);
+$('category').addEventListener('change',rememberMarketSelection);
+</script>
+</body>
+</html>
+"""

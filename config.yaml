@@ -1,0 +1,39 @@
+exchange:
+  name: bitget
+  category: USDT-FUTURES
+  symbol: BTCUSDT
+  interval: 1H
+markets:
+  crypto:
+    market_type: CRYPTO
+    timezone: Asia/Shanghai
+  kor_stock:
+    market_type: KOR_STOCK
+    timezone: Asia/Seoul
+    regular_session: "09:00-15:30"
+  us_stock:
+    market_type: US_STOCK
+    timezone: America/New_York
+    regular_session: "09:30-16:00"
+backtest:
+  initial_cash: 10000
+  fee_rate: 0.0006
+  slippage_rate: 0.0002
+  leverage: 1
+strategy:
+  name: sma_cross
+  fast: 20
+  slow: 60
+risk:
+  max_order_pct: 0.1
+  max_position_pct: 0.3
+  max_daily_loss_pct: 0.03
+  max_leverage: 3
+  max_consecutive_losses: 3
+trading:
+  mode: paper
+  allow_short: false
+  kill_switch: false
+alert:
+  enabled: false
+  provider: telegram

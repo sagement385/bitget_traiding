@@ -1,0 +1,48 @@
+{
+  "event_id": "osong_2023_07_15",
+  "event_name": "오송 궁평2지하차도 침수 사고",
+  "source": {
+    "source_name": "국무조정실 오송 궁평2지하차도 침수사고 감찰조사 결과",
+    "source_url": "https://www.opm.go.kr/opm/news/press1.do?articleNo=154431&attachNo=136402&mode=download",
+    "source_type": "official_report"
+  },
+  "timeline": [
+    {
+      "time": "2023-07-14T17:20:00+09:00",
+      "event_type": "flood_advisory_issued",
+      "location": "미호천교",
+      "description": "미호천교 지점 홍수주의보 발령"
+    },
+    {
+      "time": "2023-07-15T04:10:00+09:00",
+      "event_type": "flood_warning_issued",
+      "location": "미호천교",
+      "description": "미호천교 지점 홍수경보 격상"
+    },
+    {
+      "time": "2023-07-15T06:40:00+09:00",
+      "event_type": "design_flood_level_reached",
+      "location": "미호천교",
+      "design_flood_level_el_m": 29.02,
+      "description": "미호천교 수위가 계획홍수위 29.02m에 도달"
+    },
+    {
+      "time": "2023-07-15T07:50:00+09:00",
+      "event_type": "overflow_started",
+      "location": "미호천교 부근 임시제방",
+      "description": "임시제방 쪽 월류 시작"
+    },
+    {
+      "time": "2023-07-15T08:09:00+09:00",
+      "event_type": "confirmed_levee_collapse",
+      "location": "미호천교 부근 임시제방",
+      "description": "임시제방 붕괴"
+    },
+    {
+      "time": "2023-07-15T08:27:00+09:00",
+      "event_type": "underpass_inflow_started",
+      "location": "궁평2지하차도",
+      "description": "궁평2지하차도에 강물 유입 시작"
+    }
+  ]
+}

@@ -640,6 +640,7 @@ def _trade_rows(trades: pd.DataFrame, limit: int = 80) -> list[dict[str, Any]]:
     for _, r in trades.tail(limit).iloc[::-1].iterrows():
         rows.append(
             {
+                "timestamp": int(_num(r.get("timestamp"))),
                 "date": pd.to_datetime(int(_num(r.get("timestamp"))), unit="ms").strftime("%Y-%m-%d %H:%M"),
                 "side": str(r.get("side", "")),
                 "symbol": str(r.get("symbol", "")),
@@ -653,7 +654,52 @@ def _trade_rows(trades: pd.DataFrame, limit: int = 80) -> list[dict[str, Any]]:
     return rows
 
 
+def _validate_backtest_payload(payload: dict[str, Any]) -> None:
+    """Reject invalid UI input before touching the candle cache or strategy engine."""
+    allowed_strategies = {
+        "sma_cross", "rsi", "rsi_reversal", "breakout", "scalp_vwap_rsi", "scalp",
+        "price_action_volume", "pa_volume", "multi_timeframe_momentum", "mtf_momentum",
+    }
+    strategy = str(payload.get("strategy") or "sma_cross").strip().lower()
+    if strategy not in allowed_strategies:
+        raise ValueError(f"Unsupported strategy: {strategy}")
+    interval = str(payload.get("interval") or "1H").strip()
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"Unsupported interval: {interval}")
+    try:
+        initial_cash = float(10000 if payload.get("initialCash") in (None, "") else payload.get("initialCash"))
+        fee_rate = float(0.0006 if payload.get("feeRate") in (None, "") else payload.get("feeRate"))
+        slippage_rate = float(0.0002 if payload.get("slippageRate") in (None, "") else payload.get("slippageRate"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Initial cash, fee rate, and slippage must be numeric") from exc
+    if initial_cash <= 0:
+        raise ValueError("Initial cash must be greater than zero")
+    if fee_rate < 0 or slippage_rate < 0:
+        raise ValueError("Fee rate and slippage cannot be negative")
+    start = str(payload.get("start") or "2024-01-01").strip()
+    end = str(payload.get("end") or "").strip()
+    try:
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end) if end else None
+    except Exception as exc:
+        raise ValueError("Start and end dates must be valid dates") from exc
+    if end_ts is not None and start_ts > end_ts:
+        raise ValueError("Start date must be before the end date")
+    positive_fields = ("volumeMult", "pullbackBars", "minRelVolume", "minAtrPct", "stopAtr", "takeAtr", "breakoutWindow", "rsiPeriod")
+    for field in positive_fields:
+        if payload.get(field) in (None, ""):
+            continue
+        try:
+            if float(payload[field]) <= 0:
+                raise ValueError(f"{field} must be greater than zero")
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(field):
+                raise
+            raise ValueError(f"{field} must be numeric") from exc
+
+
 def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    _validate_backtest_payload(payload)
     symbol = str(payload.get("symbol") or "BTCUSDT").upper()
     category = _normalize_category(payload.get("category"))
     market_type = normalize_market_type(payload.get("market_type"), category)
@@ -661,9 +707,9 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     strategy_name = str(payload.get("strategy") or "sma_cross")
     fast = int(payload.get("fast") or 20)
     slow = int(payload.get("slow") or 60)
-    initial_cash = float(payload.get("initialCash") or 10000)
-    fee_rate = float(payload.get("feeRate") or 0.0006)
-    slippage_rate = float(payload.get("slippageRate") or 0.0002)
+    initial_cash = float(10000 if payload.get("initialCash") in (None, "") else payload.get("initialCash"))
+    fee_rate = float(0.0006 if payload.get("feeRate") in (None, "") else payload.get("feeRate"))
+    slippage_rate = float(0.0002 if payload.get("slippageRate") in (None, "") else payload.get("slippageRate"))
     allow_short = bool(payload.get("allowShort") or False)
     source = str(payload.get("source") or "local")
     start = str(payload.get("start") or "2024-01-01")
@@ -676,7 +722,7 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             # UI backtest uses a bounded, cache-first window to avoid thousands of API calls.
             # For full offline history use: python -m src.main backfill-full.
-            df, report = load_or_fetch_candles(symbol, category, interval, start, end, limit=1000, source='bitget', repair=True, strict_backtest=True)
+            df, report = load_or_fetch_candles(symbol, category, interval, start, end, limit=int(payload.get("limit") or 600), source='bitget', repair=True, strict_backtest=True)
             _maybe_save_csv(df, _csv_path(symbol, interval, market_type))
     elif source == "toss":
         if market_type == CRYPTO:
@@ -742,7 +788,7 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "requested_end": end or "now",
                 "actually_used_start": pd.to_datetime(int(dataset["first_timestamp"]), unit="ms").isoformat(),
                 "actually_used_end": pd.to_datetime(int(dataset["last_timestamp"]), unit="ms").isoformat(),
-                "limited": bool(len(df) >= 1000),
+                "limited": bool(len(df) >= int(payload.get("limit") or 600)),
             }
         )
     return {
@@ -1482,6 +1528,22 @@ HTML = r"""
 <style>
 .positionRow{padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid #1d2b38}.positionRow:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}.positionRowHead{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}.positionRowHead b{color:#e4f0f3}.fillList,.notificationList{display:grid;gap:7px;width:100%;padding:10px 12px}.fillRow,.notificationRow{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:10px;color:#8da0ac}.fillRow b{white-space:nowrap}.notificationRow{display:grid;gap:3px;padding-bottom:6px;border-bottom:1px solid #1d2b38}.notificationRow small{color:#647b87}.notificationRow.warning span{color:#f0c56c}.notificationRow.error span{color:#ff7b83}
 </style>
+<style>
+.strategyWorkspace{border:1px solid #24505a!important;background:#0b1a24!important}
+.strategyWorkspace .box{display:grid;gap:8px}
+.workspaceActions{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.workspaceActions .btn{padding:8px 6px;font-size:11px}
+.workspaceStatus{min-height:34px;padding:8px;border-radius:6px;background:#09131b;color:#8fa7b3;font-size:11px;line-height:1.4}
+.workspaceStatus.ok{color:#7ee8be}.workspaceStatus.bad{color:#ff9a9f}
+.performancePanel{min-height:108px!important}
+.performanceHeader{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #1d2b38}
+.performanceHeader select{width:auto;min-width:86px;padding:4px 6px;font-size:10px}
+.performanceSummary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;padding:9px 12px 0}
+.performanceMetric{min-width:0;color:#8194a2;font-size:10px}.performanceMetric b{display:block;margin-top:3px;color:#dce9ee;font-size:12px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.performanceMetric b.positive{color:#22d3a1}.performanceMetric b.negative{color:#ff7a82}
+.performanceChart{height:82px;margin:4px 10px 8px;overflow:hidden;border-top:1px solid #172937;background:#0a141c}.performanceChart svg{display:block;width:100%;height:100%}.performanceEmpty{display:grid;place-items:center;height:82px;color:#677b87;font-size:11px;text-align:center}
+.analysisTabs{display:flex;gap:4px;padding:7px 12px 0}.analysisTabs button{border:0;border-bottom:2px solid transparent;background:transparent;color:#718594;padding:3px 5px;font-size:10px;cursor:pointer}.analysisTabs button.active{border-bottom-color:#20d0d1;color:#d6fbfc}
+@media(max-width:1450px) and (min-width:1181px){.dashboardShell{grid-template-columns:210px minmax(0,1fr) 300px!important}.dashboardShell .rail{padding-left:10px;padding-right:10px}.dashboardShell .right{padding-left:8px;padding-right:8px}.shellTabs{gap:0}.shellTab{padding-left:7px;padding-right:7px;font-size:10px}}
+</style>
 </head>
 <body>
 <div class="app">
@@ -1741,8 +1803,30 @@ async function refreshDashboardAccountState(){const request=++dashboardAccountRe
 function selectDashboardTradingMode(mode){const button=document.querySelector('.modeButton[data-mode="'+mode+'"]');if(!button||button.disabled)return;dashboardTradingMode=mode;document.querySelectorAll('.modeButton').forEach(node=>node.classList.toggle('active',node.dataset.mode===mode));const badge=$('shellModeBadge');if(badge){badge.textContent=mode;badge.classList.toggle('demo',mode==='DEMO');badge.classList.toggle('live',mode==='LIVE')}refreshDashboardAccountState()}
 function dashboardValue(value,digits=2,suffix=''){if(value===null||value===undefined||value==='')return '--';const number=Number(value);return Number.isFinite(number)?number.toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits})+suffix:'--'}
 function renderDashboardRisk(data){const risk=data.risk||{};const connected=data.account?.status==='connected';const daily=connected?Number(risk.daily_pnl):NaN;const limit=connected?Number(risk.daily_loss_limit):NaN;const usage=connected?Number(risk.daily_loss_usage_pct):NaN;if($('shellRiskDaily'))$('shellRiskDaily').textContent=Number.isFinite(daily)?dashboardValue(daily,2,' USDT'):'--';if($('shellRiskLosses'))$('shellRiskLosses').textContent=connected&&Number.isFinite(Number(risk.consecutive_losses))?String(risk.consecutive_losses)+' / '+String(risk.max_consecutive_losses??'--'):'--';if($('shellRiskLeverage'))$('shellRiskLeverage').textContent=connected&&Number.isFinite(Number(risk.max_leverage))?dashboardValue(risk.max_leverage,1)+'x / '+dashboardValue(risk.configured_max_leverage,1)+'x':'--';const bar=$('shellRiskDailyBar');if(bar)bar.style.width=(Number.isFinite(usage)?Math.min(100,Math.max(0,usage)):0)+'%';const riskPanel=$('risk');if(riskPanel)riskPanel.innerHTML='<div class="metric"><span>일일 손익</span><b class="'+(daily>=0?'green':'red')+'">'+(Number.isFinite(daily)?dashboardValue(daily,2,' USDT'):'--')+'</b></div><div class="metric"><span>손실 한도</span><b>'+(Number.isFinite(limit)?dashboardValue(limit,2,' USDT'):'--')+'</b></div><div class="metric"><span>총 노출</span><b>'+dashboardValue(connected?risk.gross_exposure:null,2,' USDT')+'</b></div>'}
-function renderDashboardAccount(data){dashboardAccountState=data;const account=data.account||{};const status=dashboardStatusLabel(data.status||account.status);const connected=account.status==='connected';if($('shellAccountState'))$('shellAccountState').textContent=status;if($('shellEquity'))$('shellEquity').textContent=dashboardValue(connected?account.equity:null,2);if($('shellAvailable'))$('shellAvailable').textContent=dashboardValue(connected?account.available:null,2);if($('shellAccountReturn'))$('shellAccountReturn').textContent='--';const pnl=connected?Number(data.risk?.daily_pnl):NaN;const equity=connected?Number(account.equity):NaN;const dailyReturn=Number.isFinite(pnl)&&Number.isFinite(equity)&&equity!==0?pnl/equity*100:null;if($('shellKpiReturn'))$('shellKpiReturn').textContent=dashboardValue(dailyReturn,2,'%');if($('shellKpiProfit'))$('shellKpiProfit').textContent=dashboardValue(connected?pnl:null,2,' USDT');if($('shellKpiReturnMeta'))$('shellKpiReturnMeta').textContent=data.mode+' 기준 당일 손익';if($('shellKpiDrawdown'))$('shellKpiDrawdown').textContent='--';if($('shellKpiSharpe'))$('shellKpiSharpe').textContent='--';const kpiTitle=document.querySelector('.kpiCard span');if(kpiTitle)kpiTitle.textContent='당일 수익률';renderDashboardPositions(data);renderDashboardFills(data);renderDashboardNotifications(data);renderDashboardRisk(data);updateDashboardModeAvailability(data);if($('status')&&data.error)$('status').textContent='Account sync error\\n'+data.error}
+function renderDashboardAccount(data){dashboardAccountState=data;const account=data.account||{};const status=dashboardStatusLabel(data.status||account.status);const connected=account.status==='connected';if($('shellAccountState'))$('shellAccountState').textContent=status;if($('shellEquity'))$('shellEquity').textContent=dashboardValue(connected?account.equity:null,2);if($('shellAvailable'))$('shellAvailable').textContent=dashboardValue(connected?account.available:null,2);if($('shellAccountReturn'))$('shellAccountReturn').textContent='--';const pnl=connected?Number(data.risk?.daily_pnl):NaN;const equity=connected?Number(account.equity):NaN;const dailyReturn=Number.isFinite(pnl)&&Number.isFinite(equity)&&equity!==0?pnl/equity*100:null;if($('shellKpiReturn'))$('shellKpiReturn').textContent=dashboardValue(dailyReturn,2,'%');if($('shellKpiProfit'))$('shellKpiProfit').textContent=dashboardValue(connected?pnl:null,2,' USDT');if($('shellKpiReturnMeta'))$('shellKpiReturnMeta').textContent=data.mode+' 기준 당일 손익';if($('shellKpiDrawdown'))$('shellKpiDrawdown').textContent='--';if($('shellKpiSharpe'))$('shellKpiSharpe').textContent='--';const kpiTitle=document.querySelector('.kpiCard span');if(kpiTitle)kpiTitle.textContent='당일 수익률';renderDashboardPositions(data);renderDashboardFills(data);renderDashboardNotifications(data);renderDashboardRisk(data);updateDashboardModeAvailability(data);if($('status')&&data.error)$('status').textContent='Account sync error\\n'+data.error;if(lastPayload?.metrics)stage3RenderPerformance(lastPayload)}
+var stage3BacktestBusy=false;
+var stage3StrategyFields=['initialCash','feeRate','slippageRate','allowShort','volumeMult','pullbackBars','minRelVolume','minAtrPct','stopAtr','takeAtr'];
+function stage3StrategyKey(){const symbol=($('symbol')?.value||'BTCUSDT').trim().toUpperCase();const category=normalizeCategory($('category')?.value||'USDT-FUTURES');const strategy=$('strategy')?.value||'sma_cross';return 'bitget-dashboard-strategy-v1:'+symbol+':'+category+':'+strategy}
+function stage3ReadSavedSettings(){try{return JSON.parse(localStorage.getItem(stage3StrategyKey())||'{}')||{}}catch(error){return {}}}
+function stage3ApplySavedSettings(){const saved=stage3ReadSavedSettings();for(const id of stage3StrategyFields){if(saved[id]!==undefined&&$(id))$(id).value=String(saved[id])}const status=$('shellStrategyStatus');if(status)status.textContent=Object.keys(saved).length?'저장된 전략 설정을 불러왔습니다.':'현재 전략 설정을 사용합니다.'}
+function stage3CaptureSettings(){const result={};for(const id of stage3StrategyFields){const node=$(id);if(node)result[id]=node.value}return result}
+function stage3SaveSettings(){try{localStorage.setItem(stage3StrategyKey(),JSON.stringify(stage3CaptureSettings()));const status=$('shellStrategyStatus');if(status){status.textContent='전략 설정이 이 브라우저에 저장되었습니다.';status.className='workspaceStatus ok'}toast('전략 설정 저장 완료')}catch(error){const status=$('shellStrategyStatus');if(status){status.textContent='전략 설정을 저장하지 못했습니다.';status.className='workspaceStatus bad'}toast('전략 설정 저장 실패',true)}}
+function stage3ValidateForm(){const numberFields=[['initialCash','초기 자본',value=>value>0],['feeRate','수수료',value=>value>=0],['slippageRate','슬리피지',value=>value>=0],['volumeMult','거래량 배수',value=>value>0],['pullbackBars','되돌림 바',value=>value>0],['minRelVolume','최소 상대 거래량',value=>value>0],['minAtrPct','최소 ATR',value=>value>0],['stopAtr','손절 ATR',value=>value>0],['takeAtr','익절 R',value=>value>0]];for(const [id,label,check] of numberFields){const value=Number($(id)?.value);if(!Number.isFinite(value)||!check(value)){toast(label+' 값을 확인해 주세요.',true);$(id)?.focus();return false}}const start=$('start')?.value,end=$('end')?.value;if(start&&end&&start>end){toast('시작일은 종료일보다 빠르거나 같아야 합니다.',true);$('start')?.focus();return false}return true}
+function stage3SetWorkspaceStatus(message,kind=''){const status=$('shellStrategyStatus');if(!status)return;status.textContent=message;status.className='workspaceStatus'+(kind?' '+kind:'')}
+function stage3PerformancePoints(data){const points=(data.equity||[]).filter(point=>Number.isFinite(Number(point.time))&&Number.isFinite(Number(point.value))).map(point=>({time:Number(point.time),value:Number(point.value)}));const range=$('shellPerformanceRange')?.value||'all';if(range==='all'||!points.length)return points;const cutoff=points[points.length-1].time-(range==='7d'?7:30)*86400;return points.filter(point=>point.time>=cutoff)}
+function stage3Stats(data){const points=stage3PerformancePoints(data);if(points.length<2)return null;const first=points[0].value,last=points[points.length-1].value;const mdd=Math.min(...points.map((point,index)=>{const prior=Math.max(...points.slice(0,index+1).map(item=>item.value));return prior?((point.value/prior)-1)*100:0}));const returns=[];for(let index=1;index<points.length;index++){const previous=points[index-1].value;if(previous)returns.push((points[index].value/previous)-1)}const mean=returns.length?returns.reduce((sum,value)=>sum+value,0)/returns.length:0;const variance=returns.length>1?returns.reduce((sum,value)=>sum+Math.pow(value-mean,2),0)/(returns.length-1):0;const std=Math.sqrt(variance);const trades=(data.trades||[]).filter(trade=>!trade.timestamp||Number(trade.timestamp)/1000>=points[0].time);const wins=trades.filter(trade=>Number(trade.pnl)>0).length;const baseMetrics=data.metrics||{};return {initial:first,final:last,profit:last-first,totalReturn:first?((last/first)-1)*100:null,mdd:Number.isFinite(mdd)?mdd:null,sharpe:std?mean/std*Math.sqrt(returns.length):($('shellPerformanceRange')?.value==='all'?baseMetrics.sharpe:null),winRate:trades.length?wins/trades.length*100:($('shellPerformanceRange')?.value==='all'?baseMetrics.win_rate:null),tradeCount:trades.length||($('shellPerformanceRange')?.value==='all'?baseMetrics.trade_count:null),avgRR:$('shellPerformanceRange')?.value==='all'?baseMetrics.avg_profit_loss_ratio:null,points}}
+function stage3ChartPoints(data){const view=$('shellPerformanceView')?.value||'equity';if(view==='drawdown')return (data.drawdown||[]).filter(point=>Number.isFinite(Number(point.time))&&Number.isFinite(Number(point.value))).map(point=>({time:Number(point.time),value:Number(point.value)}));if(view==='monthly')return (data.monthly||[]).map(point=>({time:Date.UTC(Number(point.year),Number(point.month)-1,1)/1000,value:Number(point.value)}));return stage3PerformancePoints(data)}
+function stage3RenderChart(data){const target=$('shellEquityChart');if(!target)return;const points=stage3ChartPoints(data);if(points.length<2){target.innerHTML='<div class="performanceEmpty">선택한 기간의 성과 데이터가 없습니다.</div>';return}const sampled=points.length>90?points.filter((point,index)=>index===0||index===points.length-1||index%Math.ceil(points.length/90)===0):points;const values=sampled.map(point=>point.value);let min=Math.min(...values),max=Math.max(...values);if(min===max){min-=1;max+=1}const width=360,height=82,pad=6;const path=sampled.map((point,index)=>{const x=pad+(width-pad*2)*(index/Math.max(1,sampled.length-1));const y=height-pad-(point.value-min)/(max-min)*(height-pad*2);return (index?'L':'M')+x.toFixed(1)+' '+y.toFixed(1)}).join(' ');const color=$('shellPerformanceView')?.value==='drawdown'?'#ef6b73':'#22d3a1';target.innerHTML='<svg viewBox="0 0 360 82" role="img" aria-label="performance chart" preserveAspectRatio="none"><path d="'+path+'" fill="none" stroke="'+color+'" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>'}
+function stage3RenderPerformance(data){const stats=stage3Stats(data);const summary=$('shellPerformanceSummary');if(!stats){if(summary)summary.innerHTML='<div class="performanceEmpty">백테스트를 실행하면 실제 거래 기록 기반 성과가 표시됩니다.</div>';const chart=$('shellEquityChart');if(chart)chart.innerHTML='';return}const positive=value=>Number(value)>=0?'positive':'negative';const value=(number,digits=2,suffix='')=>number===null||number===undefined||!Number.isFinite(Number(number))?'--':dashboardValue(number,digits,suffix);if(summary)summary.innerHTML=[['수익률',value(stats.totalReturn,2,'%'),positive(stats.totalReturn)],['누적 수익',value(stats.profit,2,' USDT'),positive(stats.profit)],['MDD',value(stats.mdd,2,'%'),'negative'],['승률',value(stats.winRate,2,'%'),positive(stats.winRate)]].map(row=>'<div class="performanceMetric"><span>'+row[0]+'</span><b class="'+row[2]+'">'+row[1]+'</b></div>').join('');if($('shellPerformanceRangeLabel'))$('shellPerformanceRangeLabel').textContent=($('shellPerformanceRange')?.selectedOptions?.[0]?.textContent||'전체 기간');if($('shellKpiReturn'))$('shellKpiReturn').textContent=value(stats.totalReturn,2,'%');if($('shellKpiProfit'))$('shellKpiProfit').textContent=value(stats.profit,2,' USDT');if($('shellKpiDrawdown'))$('shellKpiDrawdown').textContent=value(stats.mdd,2,'%');if($('shellKpiSharpe'))$('shellKpiSharpe').textContent=value(stats.sharpe,2);if($('shellKpiReturnMeta'))$('shellKpiReturnMeta').textContent='백테스트 · '+(($('strategy')?.selectedOptions?.[0]?.textContent)||data.strategy||'-');stage3RenderChart(data)}
+function renderMetrics(metrics={}){const display=(value,digits=2,suffix='')=>value===undefined||value===null?'--':dashboardValue(value,digits,suffix);const rows=[['초기 자본',display(metrics.initial_cash)],['최종 자본',display(metrics.final_equity)],['총 수익률',display(metrics.total_return,2,'%')],['최대 낙폭',display(metrics.mdd,2,'%')],['Sharpe',display(metrics.sharpe)],['승률',display(metrics.win_rate,2,'%')],['평균 R/R',display(metrics.avg_profit_loss_ratio)],['거래 횟수',display(metrics.trade_count,0)]];$('metrics').innerHTML=rows.map(([name,value])=>'<div class="metric"><span>'+name+'</span><b>'+value+'</b></div>').join('');$('risk').innerHTML='<div class="metric"><span>수수료/슬리피지 반영</span><b>ON</b></div><div class="metric"><span>Live 주문</span><b class="red">차단 기본값</b></div><div class="metric"><span>성과 상태</span><b>'+((metrics.trade_count||0)>0?'거래 기록 기반':'거래 없음')+'</b></div>'}
+function renderResult(data){olderLoadArmed=false;lastPayload=data;if(!setCandles(data.candles||[],{keepOnEmpty:true})){toast('표시할 캔들이 없습니다.',true);return}setMarkers(data.markers||[]);setTradeLevels(data.tradeLevels||[]);lastIndicators=data.indicators||{overlay:{},lower:{}};applyIndicators();renderMetrics(data.metrics||{});renderTrades(data.trades||[]);$('titleSym').textContent=data.symbol+' '+data.interval;priceChart.timeScale().fitContent();syncPaneRanges();stage3RenderPerformance(data);setNetBadge('READY','backtest complete');setStatus('백테스트 완료\nrows='+data.rows+'\nstrategy='+($('strategy')?.value||'-')+'\nmarkers='+(data.markers||[]).length);stage3SetWorkspaceStatus('백테스트 결과가 차트와 성과 패널에 반영되었습니다.','ok')}
+function stage3SyncBacktestButtons(){const disabled=stage3BacktestBusy;['runBtn','shellRunBacktest'].forEach(id=>{if($(id))$(id).disabled=disabled})}
+async function runBacktest(source='local'){if(stage3BacktestBusy||!stage3ValidateForm())return;closeLive();syncToday();const seq=++backtestRequestSeq;stage3BacktestBusy=true;stage3SyncBacktestButtons();setNetBadge('LOADING','백테스트 실행 중');setStatus('백테스트 실행 중...');stage3SetWorkspaceStatus('실제 캔들 데이터를 조회하고 전략을 실행하는 중입니다.');try{const request=payload(source);const response=await fetch('/api/backtest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});const data=await response.json();if(seq!==backtestRequestSeq)return;if(!data.ok)throw Error(data.error||'backtest failed');if(!sameResponseContext(data,request))return;renderResult(data);toast('백테스트 완료')}catch(error){if(seq!==backtestRequestSeq)return;setNetBadge('ERROR',error.message);setStatus('백테스트 오류: '+error.message);stage3SetWorkspaceStatus('백테스트를 실행하지 못했습니다: '+error.message,'bad');toast(error.message,true)}finally{if(seq===backtestRequestSeq){stage3BacktestBusy=false;stage3SyncBacktestButtons()}}}
+function setDashboardShellNav(page){document.querySelectorAll('.sideNavItem,.shellTab').forEach(node=>node.classList.toggle('is-active',node.dataset.page===page));const drawer=$('controlDrawer');if(page==='dashboard'){drawer?.classList.remove('drawer-open');return}drawer?.classList.add('drawer-open');const focusTarget={backtest:'shellRunBacktest',strategy:'strategy',settings:'symbol',paper:'initialCash',demo:'symbol',live:'symbol'}[page];const target=focusTarget?$(focusTarget):null;if(target){target.focus({preventScroll:true});target.scrollIntoView({block:'nearest'})}if(page==='backtest')setWorkspaceStatus('백테스트 조건을 확인한 뒤 실행하세요. 결과는 차트와 성과 패널에 표시됩니다.');else if(page==='strategy')setWorkspaceStatus('전략 파라미터를 조정하고 저장할 수 있습니다.');else if(page==='live')setStatus('Live mode is locked until API, account, consent, and risk checks are connected.');else if(page!=='dashboard')setStatus(page+' workspace is ready.')}
+function setupStage3Controls(){const left=$('controlDrawer');if(left&&!left.querySelector('.strategyWorkspace'))left.insertAdjacentHTML('afterbegin','<section class="panel strategyWorkspace"><h3>백테스트 작업공간</h3><div class="box"><div class="workspaceActions"><button class="btn blue" id="shellRunBacktest" type="button">백테스트 실행</button><button class="btn gray" id="shellSaveStrategy" type="button">전략 저장</button></div><div class="workspaceStatus" id="shellStrategyStatus">전략 설정을 확인하세요.</div></div></section>');const chartWrap=document.querySelector('.chartWrap');const lower=chartWrap?.querySelector('.dashboardLower');const performance=lower?.querySelector('.lowerPanel');if(performance&&!performance.querySelector('.performanceHeader')){performance.classList.add('performancePanel');performance.innerHTML='<div class="performanceHeader"><span>전략 성과 분석</span><span><select id="shellPerformanceRange"><option value="all">전체 기간</option><option value="7d">최근 7일</option><option value="30d">최근 30일</option></select><select id="shellPerformanceView"><option value="equity">수익 곡선</option><option value="drawdown">드로우다운</option><option value="monthly">월별 성과</option></select></span></div><div class="performanceSummary" id="shellPerformanceSummary"><div class="performanceEmpty">백테스트 결과 대기</div></div><div class="performanceChart" id="shellEquityChart"></div>'}stage3ApplySavedSettings();if($('runBtn'))$('runBtn').onclick=()=>runBacktest(activeMarketType==='CRYPTO'?sourceForInterval():'toss');$('shellRunBacktest')?.addEventListener('click',()=>runBacktest(activeMarketType==='CRYPTO'?sourceForInterval():'toss'));$('shellSaveStrategy')?.addEventListener('click',stage3SaveSettings);$('strategy')?.addEventListener('change',()=>{stage3ApplySavedSettings();setWorkspaceStatus('선택한 전략의 저장 설정을 불러왔습니다.')});$('shellPerformanceRange')?.addEventListener('change',()=>{if(lastPayload)stage3RenderPerformance(lastPayload)});$('shellPerformanceView')?.addEventListener('change',()=>{if(lastPayload)stage3RenderPerformance(lastPayload)});stage3SyncBacktestButtons()}
+function renderDashboardFills(data){if(lastPayload?.trades?.length&&data.mode==='PAPER'&&data.account?.status!=='connected')return;const fills=data.fills||[];const rows=$('tradeRows');if(rows)rows.innerHTML=fills.slice(0,12).map(fill=>'<tr><td>'+dashboardTime(fill.timestamp)+'</td><td class="'+(fill.side==='sell'?'red':'green')+'">'+escapeHtml(fill.side||'-')+'</td><td>'+dashboardValue(fill.price,2)+'</td><td class="'+(Number(fill.pnl)>=0?'green':'red')+'">'+dashboardValue(fill.pnl,2)+'</td></tr>').join('');const empty=$('shellTradesEmpty');if(!empty)return;if(!fills.length){empty.innerHTML='<span><strong>거래 내역 없음</strong>'+(data.account?.status==='connected'?'최근 체결 기록이 없습니다.':'계좌 연결 후 최근 체결을 표시합니다.')+'</span>';return}empty.innerHTML='<div class="fillList">'+fills.slice(0,4).map(fill=>'<div class="fillRow"><span>'+dashboardTime(fill.timestamp)+' '+escapeHtml(fill.symbol||'-')+'</span><b class="'+(fill.side==='sell'?'red':'green')+'">'+escapeHtml(fill.side||'-')+' '+dashboardValue(fill.pnl,2)+'</b></div>').join('')+'</div>'}
 setupDashboardShell();
+setupStage3Controls();
 document.querySelectorAll('.modeButton').forEach(button=>button.onclick=()=>selectDashboardTradingMode(button.dataset.mode));
 refreshDashboardAccountState();
  applyFeatureFlags();updateStockPanels();

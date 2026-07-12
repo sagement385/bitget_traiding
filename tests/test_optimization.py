@@ -102,3 +102,17 @@ def test_account_snapshot_is_explicit_when_credentials_are_missing(monkeypatch):
     assert payload["account"]["equity"] is None
     assert payload["positions"] == []
     assert payload["notifications"][0]["code"] == "credentials_missing"
+
+
+def test_ui_backtest_rejects_invalid_strategy_inputs():
+    from fastapi.testclient import TestClient
+    from src.ui.app import app
+
+    client = TestClient(app)
+    response = client.post("/api/backtest", json={"initialCash": 0, "interval": "1H", "strategy": "sma_cross"})
+    assert response.status_code == 400
+    assert "Initial cash" in response.json()["error"]
+
+    response = client.post("/api/backtest", json={"start": "2025-02-01", "end": "2025-01-01", "interval": "1H"})
+    assert response.status_code == 400
+    assert "before" in response.json()["error"]

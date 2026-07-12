@@ -173,3 +173,26 @@ def test_ui_chart_payload_uses_quote_turnover_and_preserves_alignment():
     assert [row["time"] for row in turnover] == [row["time"] for row in candles]
     assert [row["time"] for row in indicators["lower"]["volumeSma20"]] == [row["time"] for row in candles]
     assert indicators["lower"]["volumeSma20"][1]["value"] == 210
+
+
+def test_public_strategy_catalog_replaces_legacy_ui_choices():
+    from fastapi.testclient import TestClient
+    from src.data_engine.demo_data import make_demo_candles
+    from src.strategies.factory import PUBLIC_STRATEGIES, make_strategy
+    import src.ui.app as uiapp
+
+    assert set(PUBLIC_STRATEGIES) == {"trend_pullback", "donchian_atr_breakout", "chart_ai_consensus"}
+    frame = make_demo_candles(interval="1m", periods=320)
+    for name in PUBLIC_STRATEGIES:
+        strategy = make_strategy(name, symbol="BTCUSDT", allow_short=True)
+        signal = strategy.generate(frame.iloc[:240], position={"target_position": 0, "entry_price": 0})
+        assert signal.symbol == "BTCUSDT"
+        assert signal.target_position in (-1, 0, 1)
+        assert isinstance(signal.metadata or {}, dict)
+
+    html = TestClient(uiapp.app).get("/").text
+    assert 'value="trend_pullback"' in html
+    assert 'value="donchian_atr_breakout"' in html
+    assert 'value="chart_ai_consensus"' in html
+    assert 'value="sma_cross"' not in html
+    assert 'value="multi_timeframe_momentum"' not in html

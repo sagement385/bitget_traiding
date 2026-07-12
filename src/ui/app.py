@@ -739,10 +739,12 @@ def _trade_rows(trades: pd.DataFrame, limit: int = 80) -> list[dict[str, Any]]:
 def _validate_backtest_payload(payload: dict[str, Any]) -> None:
     """Reject invalid UI input before touching the candle cache or strategy engine."""
     allowed_strategies = {
+        "trend_pullback", "donchian_atr_breakout", "chart_ai_consensus",
+        # Compatibility-only names for saved jobs and older API clients.
         "sma_cross", "rsi", "rsi_reversal", "breakout", "scalp_vwap_rsi", "scalp",
         "price_action_volume", "pa_volume", "multi_timeframe_momentum", "mtf_momentum",
     }
-    strategy = str(payload.get("strategy") or "sma_cross").strip().lower()
+    strategy = str(payload.get("strategy") or "trend_pullback").strip().lower()
     if strategy not in allowed_strategies:
         raise ValueError(f"Unsupported strategy: {strategy}")
     interval = str(payload.get("interval") or "1H").strip()
@@ -767,7 +769,7 @@ def _validate_backtest_payload(payload: dict[str, Any]) -> None:
         raise ValueError("Start and end dates must be valid dates") from exc
     if end_ts is not None and start_ts > end_ts:
         raise ValueError("Start date must be before the end date")
-    positive_fields = ("volumeMult", "pullbackBars", "minRelVolume", "minAtrPct", "stopAtr", "takeAtr", "breakoutWindow", "rsiPeriod")
+    positive_fields = ("volumeMult", "pullbackBars", "minRelVolume", "minAtrPct", "stopAtr", "takeAtr", "breakoutWindow", "rsiPeriod", "trendFast", "trendSlow", "entryWindow", "exitWindow", "minTurnoverRatio", "aiThreshold")
     for field in positive_fields:
         if payload.get(field) in (None, ""):
             continue
@@ -786,7 +788,7 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     category = _normalize_category(payload.get("category"))
     market_type = normalize_market_type(payload.get("market_type"), category)
     interval = str(payload.get("interval") or "1H")
-    strategy_name = str(payload.get("strategy") or "sma_cross")
+    strategy_name = str(payload.get("strategy") or "trend_pullback").strip().lower()
     fast = int(payload.get("fast") or 20)
     slow = int(payload.get("slow") or 60)
     initial_cash = float(10000 if payload.get("initialCash") in (None, "") else payload.get("initialCash"))
@@ -825,7 +827,22 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         df = _ensure_data(symbol, category, interval, limit=1000, market_type=market_type)
 
-    if strategy_name == "sma_cross":
+    if strategy_name == "trend_pullback":
+        strat = make_strategy("trend_pullback", symbol=symbol, allow_short=allow_short,
+                              fast=int(payload.get("trendFast") or 21), slow=int(payload.get("trendSlow") or 55),
+                              min_turnover_ratio=float(payload.get("minTurnoverRatio") or 0.80),
+                              stop_atr=float(payload.get("stopAtr") or 1.60), take_r=float(payload.get("takeAtr") or 2.00))
+    elif strategy_name == "donchian_atr_breakout":
+        strat = make_strategy("donchian_atr_breakout", symbol=symbol, allow_short=allow_short,
+                              entry_window=int(payload.get("entryWindow") or 20), exit_window=int(payload.get("exitWindow") or 10),
+                              min_turnover_ratio=float(payload.get("minTurnoverRatio") or 1.00),
+                              stop_atr=float(payload.get("stopAtr") or 2.00), take_r=float(payload.get("takeAtr") or 2.50))
+    elif strategy_name == "chart_ai_consensus":
+        strat = make_strategy("chart_ai_consensus", symbol=symbol, allow_short=allow_short,
+                              threshold=float(payload.get("aiThreshold") or 0.62),
+                              min_atr_pct=float(payload.get("minAtrPct") or 0.12),
+                              stop_atr=float(payload.get("stopAtr") or 1.80), take_r=float(payload.get("takeAtr") or 2.20))
+    elif strategy_name == "sma_cross":
         strat = make_strategy("sma_cross", symbol=symbol, fast=fast, slow=slow, allow_short=allow_short)
     elif strategy_name in ("rsi", "rsi_reversal"):
         strat = make_strategy("rsi", symbol=symbol, period=int(payload.get("rsiPeriod") or 14), lower=float(payload.get("rsiLower") or 30), upper=float(payload.get("rsiUpper") or 70), allow_short=allow_short)

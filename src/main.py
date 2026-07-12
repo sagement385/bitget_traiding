@@ -8,7 +8,7 @@ from src.backtest.engine import BacktestEngine
 
 
 def add_strategy_args(parser):
-    parser.add_argument('--strategy', default='sma_cross', choices=['sma_cross','rsi','rsi_reversal','breakout','scalp_vwap_rsi','scalp','price_action_volume','pa_volume','multi_timeframe_momentum','mtf_momentum'])
+    parser.add_argument('--strategy', default='trend_pullback', choices=['trend_pullback','donchian_atr_breakout','chart_ai_consensus'])
     parser.add_argument('--fast', type=int, default=20)
     parser.add_argument('--slow', type=int, default=60)
     parser.add_argument('--rsi-period', type=int, default=14)
@@ -22,11 +22,23 @@ def add_strategy_args(parser):
     parser.add_argument('--allow-short', action='store_true')
     parser.add_argument('--volume-mult', type=float, default=1.8)
     parser.add_argument('--pullback-bars', type=int, default=13)
+    parser.add_argument('--trend-fast', type=int, default=21)
+    parser.add_argument('--trend-slow', type=int, default=55)
+    parser.add_argument('--entry-window', type=int, default=20)
+    parser.add_argument('--exit-window', type=int, default=10)
+    parser.add_argument('--min-turnover-ratio', type=float, default=0.80)
+    parser.add_argument('--ai-threshold', type=float, default=0.62)
 
 
 def build_strategy_kwargs(a, symbol):
     kwargs={'symbol': symbol, 'allow_short': getattr(a, 'allow_short', False)}
-    if a.strategy == 'sma_cross':
+    if a.strategy == 'trend_pullback':
+        kwargs.update({'fast': a.trend_fast, 'slow': a.trend_slow, 'min_turnover_ratio': a.min_turnover_ratio, 'stop_atr': a.stop_atr, 'take_r': a.take_atr})
+    elif a.strategy == 'donchian_atr_breakout':
+        kwargs.update({'entry_window': a.entry_window, 'exit_window': a.exit_window, 'min_turnover_ratio': a.min_turnover_ratio, 'stop_atr': a.stop_atr, 'take_r': a.take_atr})
+    elif a.strategy == 'chart_ai_consensus':
+        kwargs.update({'threshold': a.ai_threshold, 'min_atr_pct': a.min_atr_pct, 'stop_atr': a.stop_atr, 'take_r': a.take_atr})
+    elif a.strategy == 'sma_cross':
         kwargs.update({'fast': a.fast, 'slow': a.slow})
     elif a.strategy in ('rsi','rsi_reversal'):
         kwargs.update({'period': a.rsi_period, 'lower': a.rsi_lower, 'upper': a.rsi_upper})

@@ -150,3 +150,26 @@ def test_ui_risk_settings_round_trip_and_validation(monkeypatch, tmp_path):
     invalid = client.post("/api/settings/risk", json={"max_leverage": 0})
     assert invalid.status_code == 400
     assert "max_leverage" in invalid.json()["error"]
+
+
+def test_ui_chart_payload_uses_quote_turnover_and_preserves_alignment():
+    from src.ui.app import _candles_json, _indicator_payload, _volume_json
+
+    frame = pd.DataFrame(
+        [
+            candle_row(1_700_000_000_000, close=100),
+            candle_row(1_700_000_060_000, close=110),
+            candle_row(1_700_000_120_000, close=120),
+        ]
+    )
+    frame.loc[1, "turnover"] = 0
+    candles = _candles_json(frame)
+    turnover = _volume_json(frame)
+    indicators = _indicator_payload(frame, enabled={"volume", "volumeSma20"})
+
+    assert candles[0]["turnover"] == 200
+    assert turnover[0]["value"] == 200
+    assert turnover[1]["value"] == 220
+    assert [row["time"] for row in turnover] == [row["time"] for row in candles]
+    assert [row["time"] for row in indicators["lower"]["volumeSma20"]] == [row["time"] for row in candles]
+    assert indicators["lower"]["volumeSma20"][1]["value"] == 210

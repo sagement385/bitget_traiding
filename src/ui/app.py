@@ -541,15 +541,20 @@ def _candles_json(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df.empty:
         return []
     use = df.copy()
-    for c in ["timestamp", "open", "high", "low", "close", "volume"]:
+    for c in ["timestamp", "open", "high", "low", "close", "volume", "turnover"]:
         if c in use:
             use[c] = pd.to_numeric(use[c], errors="coerce")
     use = use.dropna(subset=["timestamp", "open", "high", "low", "close"])
     if use.empty:
         return []
     use["time"] = (use["timestamp"].astype("int64") // 1000).astype("int64")
-    use["volume"] = use.get("volume", 0).fillna(0.0)
-    return use[["time", "open", "high", "low", "close", "volume"]].to_dict(orient="records")
+    if "volume" not in use:
+        use["volume"] = 0.0
+    if "turnover" not in use:
+        use["turnover"] = 0.0
+    use["volume"] = use["volume"].fillna(0.0)
+    use["turnover"] = use["turnover"].fillna(0.0)
+    return use[["time", "open", "high", "low", "close", "volume", "turnover"]].to_dict(orient="records")
 
 
 def _line_json(df: pd.DataFrame, key: str) -> list[dict[str, Any]]:
@@ -588,17 +593,27 @@ def _hist_json(df: pd.DataFrame, key: str) -> list[dict[str, Any]]:
     return use[["time", key]].rename(columns={key: "value"}).to_dict(orient="records")
 
 
+def _quote_turnover(df: pd.DataFrame) -> pd.Series:
+    """Return quote-currency turnover, falling back to close * base volume."""
+    index = df.index
+    close = pd.to_numeric(df.get("close", pd.Series(0.0, index=index)), errors="coerce").fillna(0.0)
+    volume = pd.to_numeric(df.get("volume", pd.Series(0.0, index=index)), errors="coerce").fillna(0.0)
+    turnover = pd.to_numeric(df.get("turnover", pd.Series(0.0, index=index)), errors="coerce").fillna(0.0)
+    fallback = close.mul(volume)
+    return turnover.where(turnover > 0, fallback).fillna(0.0)
+
+
 def _volume_json(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df.empty or "timestamp" not in df or "volume" not in df:
         return []
     use=df.copy()
-    for c in ["timestamp","volume","open","close"]:
+    for c in ["timestamp", "volume", "turnover", "open", "close"]:
         if c in use: use[c]=pd.to_numeric(use[c], errors="coerce")
     use=use.dropna(subset=["timestamp","volume"])
     if use.empty:
         return []
     use["time"] = (use["timestamp"].astype("int64") // 1000).astype("int64")
-    use["value"] = use["volume"].fillna(0.0)
+    use["value"] = _quote_turnover(use)
     use["color"] = (use["close"].fillna(0.0) >= use["open"].fillna(0.0)).map(
         {True: "rgba(34,197,94,.45)", False: "rgba(239,68,68,.45)"}
     )
@@ -614,11 +629,13 @@ def _indicator_payload(df: pd.DataFrame, enabled: set[str] | None = None, market
     column_keys = {
         "bbUpper": "bb_upper", "bbMid": "bb_mid", "bbLower": "bb_lower",
         "donchianHigh": "donchian_high", "donchianLow": "donchian_low",
-        "volumeSma20": "volume_sma20", "macdSignal": "macd_signal",
+        "volumeSma20": "ui_turnover_sma20", "macdSignal": "macd_signal",
         "macdHist": "macd_hist", "stochK": "stoch_k", "stochD": "stoch_d",
     }
     requested_columns = {column_keys.get(key, key) for key in active if key != "volume"}
     d = add_common_indicators(df, include=requested_columns)
+    if "volumeSma20" in active:
+        d["ui_turnover_sma20"] = _quote_turnover(d).rolling(20, min_periods=1).mean()
     resolved_market = normalize_market_type(
         market_type or (df.get("market_type", pd.Series([CRYPTO])).iloc[-1] if "market_type" in df else CRYPTO)
     )

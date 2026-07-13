@@ -915,7 +915,14 @@ def _run_backtest_payload(payload: dict[str, Any]) -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def home():
     flags = json.dumps({"stockMarkets": UI_STOCK_MARKETS, "surgeScanner": ENABLE_SURGE_SCANNER})
-    return HTMLResponse(HTML.replace("__FEATURE_FLAGS__", flags))
+    return HTMLResponse(
+        HTML.replace("__FEATURE_FLAGS__", flags),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/candles")

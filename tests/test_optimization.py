@@ -190,7 +190,9 @@ def test_public_strategy_catalog_replaces_legacy_ui_choices():
         assert signal.target_position in (-1, 0, 1)
         assert isinstance(signal.metadata or {}, dict)
 
-    html = TestClient(uiapp.app).get("/").text
+    response = TestClient(uiapp.app).get("/")
+    html = response.text
+    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
     assert 'value="trend_pullback"' in html
     assert 'value="donchian_atr_breakout"' in html
     assert 'value="chart_ai_consensus"' in html

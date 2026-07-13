@@ -28,6 +28,10 @@ Open `http://127.0.0.1:8000` in a browser. The UI starts with Bitget Futures
 crypto markets enabled; stock markets and the surge scanner remain disabled
 unless explicitly enabled in `.env`.
 
+On Windows, run `scripts\launch_bitget_trading.vbs` to start the UI in the
+background and open a maximized Chrome window automatically. A desktop
+shortcut can point to that script for one-click startup.
+
 ## Configuration
 
 Put real credentials in `.env`, never in `.env.example`.

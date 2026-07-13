@@ -552,7 +552,8 @@ def test_ui_syncs_price_and_lower_indicator_panes():
     assert 'CandlestickSeries' in html
     assert 'HistogramSeries' in html
     assert 'panes' in html
-    assert "lowerDef={volume:['Volume','hist',1]" in html
+    assert "lowerDef={volume:['거래대금','hist',1,'turnover']" in html
+    assert '/static/js/dashboard_stage5.js?v=3' in html
     assert 'subscribeVisibleLogicalRangeChange' in html
     assert 'setVisibleLogicalRange' in html
     assert 'isoUtc(startSec)' in html

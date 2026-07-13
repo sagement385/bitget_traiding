@@ -18,7 +18,7 @@ class PollingRealtimeEngine:
     WebSocket이 실패해도 이 루프로 API 키 기반 paper/demo/live 운용 가능.
     캔들 마감 후 1회만 전략을 실행한다.
     """
-    def __init__(self, *, symbol='BTCUSDT', product_type='USDT-FUTURES', interval='1m', strategy='sma_cross',
+    def __init__(self, *, symbol='BTCUSDT', product_type='USDT-FUTURES', interval='1m', strategy='trend_pullback',
                  strategy_kwargs=None, mode='paper', broker=None, poll_sec=10, window=300, out_dir='results/realtime', market_type=CRYPTO):
         self.symbol=symbol; self.product_type=product_type; self.interval=interval; self.mode=mode
         self.market_type = normalize_market_type(market_type, product_type)

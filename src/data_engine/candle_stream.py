@@ -203,6 +203,7 @@ class LiveCandleStream:
             "low": float(get("low")),
             "close": float(get("close")),
             "volume": float(get("volume", 0) or 0),
+            "turnover": float(get("turnover", 0) or 0),
         }
 
 

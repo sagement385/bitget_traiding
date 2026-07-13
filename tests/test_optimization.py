@@ -116,3 +116,87 @@ def test_ui_backtest_rejects_invalid_strategy_inputs():
     response = client.post("/api/backtest", json={"start": "2025-02-01", "end": "2025-01-01", "interval": "1H"})
     assert response.status_code == 400
     assert "before" in response.json()["error"]
+
+
+def test_ui_risk_settings_round_trip_and_validation(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    import src.ui.app as uiapp
+
+    monkeypatch.setattr(uiapp, "SETTINGS_PATH", tmp_path / "ui_settings.json")
+    client = TestClient(uiapp.app)
+
+    initial = client.get("/api/settings/risk")
+    assert initial.status_code == 200
+    assert initial.json()["risk"]["max_leverage"] == 3.0
+
+    saved = client.post(
+        "/api/settings/risk",
+        json={
+            "daily_loss_limit": 750,
+            "max_consecutive_losses": 4,
+            "max_leverage": 5,
+            "max_total_exposure": 12000,
+            "max_symbol_exposure": 6000,
+            "risk_per_trade_pct": 0.75,
+            "kill_switch": True,
+            "halt_on_connection_issue": True,
+            "halt_on_data_delay": False,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["risk"]["daily_loss_limit"] == 750
+    assert client.get("/api/settings/risk").json()["risk"]["kill_switch"] is True
+
+    invalid = client.post("/api/settings/risk", json={"max_leverage": 0})
+    assert invalid.status_code == 400
+    assert "max_leverage" in invalid.json()["error"]
+
+
+def test_ui_chart_payload_uses_quote_turnover_and_preserves_alignment():
+    from src.ui.app import _candles_json, _indicator_payload, _volume_json
+
+    frame = pd.DataFrame(
+        [
+            candle_row(1_700_000_000_000, close=100),
+            candle_row(1_700_000_060_000, close=110),
+            candle_row(1_700_000_120_000, close=120),
+        ]
+    )
+    frame.loc[1, "turnover"] = 0
+    candles = _candles_json(frame)
+    turnover = _volume_json(frame)
+    indicators = _indicator_payload(frame, enabled={"volume", "volumeSma20"})
+
+    assert candles[0]["turnover"] == 200
+    assert turnover[0]["value"] == 200
+    assert turnover[1]["value"] == 220
+    assert [row["time"] for row in turnover] == [row["time"] for row in candles]
+    assert [row["time"] for row in indicators["lower"]["volumeSma20"]] == [row["time"] for row in candles]
+    assert indicators["lower"]["volumeSma20"][1]["value"] == 210
+
+
+def test_public_strategy_catalog_replaces_legacy_ui_choices():
+    from fastapi.testclient import TestClient
+    from src.data_engine.demo_data import make_demo_candles
+    from src.strategies.factory import PUBLIC_STRATEGIES, make_strategy
+    import src.ui.app as uiapp
+
+    assert set(PUBLIC_STRATEGIES) == {"trend_pullback", "donchian_atr_breakout", "chart_ai_consensus"}
+    frame = make_demo_candles(interval="1m", periods=320)
+    for name in PUBLIC_STRATEGIES:
+        strategy = make_strategy(name, symbol="BTCUSDT", allow_short=True)
+        signal = strategy.generate(frame.iloc[:240], position={"target_position": 0, "entry_price": 0})
+        assert signal.symbol == "BTCUSDT"
+        assert signal.target_position in (-1, 0, 1)
+        assert isinstance(signal.metadata or {}, dict)
+
+    response = TestClient(uiapp.app).get("/")
+    html = response.text
+    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    assert 'value="trend_pullback"' in html
+    assert 'value="donchian_atr_breakout"' in html
+    assert 'value="chart_ai_consensus"' in html
+    assert 'value="sma_cross"' not in html
+    assert 'value="multi_timeframe_momentum"' not in html
+    assert 'const defaultOn={ema21:true,ema50:true,volume:true};' in html
+    assert 'if(int===\'1D\')return 720;return 720' in html

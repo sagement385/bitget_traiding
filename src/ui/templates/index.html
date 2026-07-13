@@ -119,7 +119,7 @@ const candleMarkers=LightweightCharts.createSeriesMarkers?LightweightCharts.crea
 const charts=[priceChart];
 const overlayDef={ema9:['EMA 9','#f59e0b'],ema21:['EMA 21','#3b82f6'],ema50:['EMA 50','#a855f7'],sma50:['SMA 50','#94a3b8'],vwap:['VWAP','#22c55e'],bbUpper:['Bollinger Upper','#64748b'],bbMid:['Bollinger Mid','#475569'],bbLower:['Bollinger Lower','#64748b'],donchianHigh:['Donchian High','#eab308'],donchianLow:['Donchian Low','#eab308'],supertrend:['SuperTrend','#10b981']};
 const lowerDef={volume:['거래대금','hist',1,'turnover'],volumeSma20:['거래대금 SMA20','line',1,'turnover'],rsi14:['RSI 14','line',2,'oscillator'],stochK:['Stoch K','line',2,'oscillator'],stochD:['Stoch D','line',2,'oscillator'],macd:['MACD','line',3,'macd'],macdSignal:['MACD Signal','line',3,'macd'],macdHist:['MACD Hist','hist',3,'macd'],atr14:['ATR 14','line',4,'volatility'],obv:['OBV','line',5,'volume']};
-const defaultOn={ema9:true,ema21:true,vwap:true,volume:true,volumeSma20:true,rsi14:true,macd:true,macdSignal:true,macdHist:true};
+const defaultOn={ema21:true,ema50:true,volume:true};
 const overlaySeries={}, lowerSeries={};
 function todayIso(){return new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,10)}
 function syncToday(){}
@@ -148,6 +148,7 @@ function setSeriesMarkers(rows){if(candleMarkers?.setMarkers)candleMarkers.setMa
  function clearAllSeries(){candleSeries.setData([]);setSeriesMarkers([]);clearTradeLevels();for(const s of Object.values(overlaySeries))s.setData([]);for(const s of Object.values(lowerSeries))s.setData([]);candleStore.replaceAll([]);allCandles=candleStore.rows;markers=[];lastIndicators={overlay:{},lower:{}}}
  function mergeCandles(a,b){const m=new Map();[...(a||[]),...(b||[])].forEach(c=>{const clean=candleStore.normalize(c);if(clean)m.set(clean.time,clean)});return [...m.values()].sort((x,y)=>x.time-y.time)}
  function setCandles(cs,{keepOnEmpty=false}={}){const clean=(cs||[]).map(c=>candleStore.normalize(c)).filter(Boolean);if(!clean.length&&keepOnEmpty&&allCandles.length)return false;candleStore.replaceAll(clean);allCandles=candleStore.rows;candleSeries.setData(allCandles);return true}
+ function fitChartWindow(){const count=allCandles.length;if(!count){priceChart.timeScale().fitContent();return}const visible=Math.min(count,chartLimit());const scale=priceChart.timeScale();if(scale.setVisibleLogicalRange){scale.setVisibleLogicalRange({from:Math.max(0,count-visible-1),to:count-1+0.5});return}scale.fitContent()}
  function mergeLiveCandles(cs){const beforeLast=allCandles.length?allCandles[allCandles.length-1].time:0;const visible=priceChart.timeScale().getVisibleRange?.();const follow=!!(visible&&beforeLast&&chartTimeSec(visible.to)>=beforeLast-intervalSec()*2);const merged=mergeCandles(allCandles,cs).slice(-6000);if(!setCandles(merged,{keepOnEmpty:true}))return false;const afterLast=allCandles.length?allCandles[allCandles.length-1].time:beforeLast;try{if(visible&&follow&&afterLast>beforeLast){const shift=afterLast-beforeLast;priceChart.timeScale().setVisibleRange({from:chartTimeSec(visible.from)+shift,to:chartTimeSec(visible.to)+shift})}else if(visible){priceChart.timeScale().setVisibleRange(visible)}}catch(e){}return true}
  function applyRealtimeCandle(c){const result=candleStore.apply(c);if(result.action==='ignored')return result;allCandles=candleStore.rows;if(result.evicted||result.action==='historical_patch')candleSeries.setData(allCandles);else candleSeries.update(candleStore.last());updateLiveLower(candleStore.last());if(result.action==='inserted'||result.candleClosed) scheduleIndicatorRefresh(80);return result}
 function filterMarkers(ms){if(!allCandles.length)return [];const lo=allCandles[0].time,hi=allCandles[allCandles.length-1].time;const filtered=(ms||[]).filter(m=>m.time>=lo&&m.time<=hi).slice(-180);const dense=filtered.length>80;return filtered.map(m=>dense?{...m,text:m.side==='buy'?'B':'S'}:m)}
@@ -173,7 +174,7 @@ function setTradeLevels(levels=[]){
 function isoDate(sec){return new Date(sec*1000).toISOString().slice(0,10)}
 function isoUtc(sec){return new Date(sec*1000).toISOString()}
 function intervalSec(){return {"1s":1,"3s":3,"5s":5,"15s":15,"30s":30,"1m":60,"2m":120,"3m":180,"5m":300,"15m":900,"30m":1800,"1H":3600,"4H":14400,"1D":86400,"1W":604800,"1M":2592000}[$('interval').value]||60}
-function chartLimit(){const int=$('interval').value;if(int.endsWith('s'))return 1800;if(int==='1M')return 1200;if(int==='1W')return 2500;return 6000}
+function chartLimit(){const int=$('interval').value;if(int.endsWith('s'))return 900;if(int==='1M')return 240;if(int==='1W')return 520;if(int==='1D')return 720;return 720}
 function olderLimit(){return Math.min(2500, chartLimit())}
 function sourceForInterval(){if(activeMarketType!=='CRYPTO')return 'toss';return $('interval').value.endsWith('s')?'local':'bitget'}
 function refreshTitle(){ $('titleSym').textContent=`${$('symbol').value.trim().toUpperCase()} ${$('interval').value}` }
@@ -235,7 +236,7 @@ async function loadCandles(source=sourceForInterval(), opts={}){
     if(!setCandles(d.candles||[],{keepOnEmpty:true}))throw Error('empty candle response');
     setMarkers([]);setTradeLevels([]);setIncomingIndicators(d.indicators);
     lastRenderMeta={symbol:p.symbol,interval:p.interval,source,stale:!!d.stale};
-    applyIndicators();priceChart.timeScale().fitContent();syncPaneRanges();
+    applyIndicators();fitChartWindow();syncPaneRanges();
     scheduleIndicatorRefresh(25);
     setNetBadge(d.stale?'STALE':'READY',d.stale?'cached data shown':'candles loaded');
     setStatus(`Candles ready\nrows=${d.rows}\ninterval=${p.interval}\ncache=${d.report?.source||'unknown'}`);

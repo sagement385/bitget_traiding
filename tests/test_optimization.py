@@ -198,3 +198,5 @@ def test_public_strategy_catalog_replaces_legacy_ui_choices():
     assert 'value="chart_ai_consensus"' in html
     assert 'value="sma_cross"' not in html
     assert 'value="multi_timeframe_momentum"' not in html
+    assert 'const defaultOn={ema21:true,ema50:true,volume:true};' in html
+    assert 'if(int===\'1D\')return 720;return 720' in html
